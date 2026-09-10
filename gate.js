@@ -490,9 +490,9 @@ async function evaluate(address, chain) {
   
   const currentPrice = Number(price.price || 0);
   const circSupply   = Number(tInfo.circulating_supply || 0);
-  const marketCapUSD = (currentPrice * circSupply > 0) ? (currentPrice * circSupply) : dexData.mc;
-
-  const liquidityUSD = Number(tInfo.liquidity || dexData.liq || 0);
+  // PREFER DexScreener for real-time Market Cap and Liquidity
+  const marketCapUSD = dexData.mc > 0 ? dexData.mc : ((currentPrice * circSupply > 0) ? (currentPrice * circSupply) : 0);
+  const liquidityUSD = dexData.liq > 0 ? dexData.liq : Number(tInfo.liquidity || 0);
 
   // ── Holder data: prefer Blockscout (real on-chain) over GMGN for unsupported chains ──
   let hasHolderData, top10Pct, devHoldPct, bundlerPct;
