@@ -502,6 +502,13 @@ async function evaluate(address, chain) {
     devHoldPct    = blockscoutData.devHoldPct ?? (stat.creator_hold_rate !== undefined ? Number(stat.creator_hold_rate) * 100 : 0);
     bundlerPct    = blockscoutData.bundlerPct ?? (stat.top_bundler_trader_percentage !== undefined ? Number(stat.top_bundler_trader_percentage) * 100 : 0);
     console.log(`[Blockscout-${resolvedChain}] ✅ Using real on-chain holder data — Top10: ${top10Pct.toFixed(1)}%`);
+  } else if (resolvedChain === 'solana' && goPlusData && goPlusData.holders && goPlusData.holders.length > 0) {
+    // If GMGN fails on Solana, calculate Top 10 directly from GoPlus security holders array
+    hasHolderData = true;
+    top10Pct = goPlusData.holders.slice(0, 10).reduce((sum, h) => sum + (Number(h.percent || 0) * 100), 0);
+    devHoldPct = stat.creator_hold_rate !== undefined ? Number(stat.creator_hold_rate) * 100 : 0;
+    bundlerPct = stat.top_bundler_trader_percentage !== undefined ? Number(stat.top_bundler_trader_percentage) * 100 : 0;
+    console.log(`[GoPlus-Solana] ✅ Using GoPlus holder data — Top10: ${top10Pct.toFixed(1)}%`);
   } else {
     hasHolderData = stat.top_10_holder_rate !== undefined;
     top10Pct      = hasHolderData ? Number(stat.top_10_holder_rate) * 100 : 0;
@@ -720,8 +727,13 @@ async function evaluate(address, chain) {
     reasons.push('[Rule 7]  Honeypot detected — sell transactions may be blocked.');
   }
   if (!lpBurned && !lpLocked && !isCurveChain) {
-    isSkip = true;
-    reasons.push('[Rule 8]  LP tokens are unburned and unlocked — rug-pull risk is high.');
+    if (resolvedChain === 'solana' && Object.keys(tSec).length === 0) {
+      isGamble = true;
+      reasons.push('[Rule 8]  LP status unknown (missing API data) — proceed with extreme caution.');
+    } else {
+      isSkip = true;
+      reasons.push('[Rule 8]  LP tokens are unburned and unlocked — rug-pull risk is high.');
+    }
   }
   if (rugRatio > 0.3) {
     isSkip = true;
