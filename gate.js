@@ -77,13 +77,18 @@ const LOOSE_RULE = {
 function extractAddress(text) {
   if (!text) return { address: null, chain: null };
 
+  let manualChain = null;
+  const tLow = text.toLowerCase();
+  if (tLow.includes('robinhood')) manualChain = 'robinhood';
+  else if (tLow.includes('hype')) manualChain = 'hype';
+
   // EVM first (unambiguous prefix)
   const evmMatch = text.match(/\b(0x[0-9a-fA-F]{40})\b/);
-  if (evmMatch) return { address: evmMatch[1], chain: 'evm' };
+  if (evmMatch) return { address: evmMatch[1], chain: manualChain || 'evm' };
 
   // Solana Base58 — 32-44 chars, alphabet excludes 0, O, I, l
   const solMatch = text.match(/\b([1-9A-HJ-NP-Za-km-z]{32,44})\b/);
-  if (solMatch) return { address: solMatch[1], chain: 'solana' };
+  if (solMatch) return { address: solMatch[1], chain: manualChain || 'solana' };
 
   return { address: null, chain: null };
 }
@@ -97,14 +102,18 @@ const EVM_CHAINS = ['eth', 'bsc', 'base', 'robinhood', 'hype', 'hyperliquid'];
 
 async function detectEvmChain(address) {
   try {
-    return await Promise.any(
-      EVM_CHAINS.map(c =>
+    return await Promise.any([
+      ...EVM_CHAINS.map(c =>
         gmgnCli('info', c, address).then(data => {
           if (Number(data?.liquidity || 0) > 0) return c;
           throw new Error('No liquidity');
         })
-      )
-    );
+      ),
+      axios.get(`https://robinhoodchain.blockscout.com/api/v2/tokens/${address.toLowerCase()}`, { timeout: 3000 }).then(res => {
+        if (res.data && res.data.name) return 'robinhood';
+        throw new Error('Not found on blockscout');
+      })
+    ]);
   } catch {
     return 'eth'; // fallback
   }
