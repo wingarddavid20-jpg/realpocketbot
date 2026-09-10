@@ -509,13 +509,17 @@ async function evaluate(address, chain) {
     bundlerPct    = stat.top_bundler_trader_percentage !== undefined ? Number(stat.top_bundler_trader_percentage) * 100 : 0;
   }
 
-  const mintAuth   = resolvedChain === 'solana'
-    ? tSec.renounced_mint === true
-    : (tSec.owner_renounced === 'yes');
+  const mintAuth = resolvedChain === 'solana'
+    ? (goPlusData ? goPlusData.mintable?.status === '0' : tSec.renounced_mint === true)
+    : (goPlusData ? goPlusData.cannot_mint === '1' : tSec.owner_renounced === 'yes');
+    
   const freezeAuth = resolvedChain === 'solana'
-    ? tSec.renounced_freeze_account === true
+    ? (goPlusData ? goPlusData.freezable?.status === '0' : tSec.renounced_freeze_account === true)
     : true; // EVM has no freeze authority concept
-  const isHoneypot = tSec.is_honeypot === 'yes';
+    
+  const isHoneypot = goPlusData
+    ? (resolvedChain === 'solana' ? false : goPlusData.is_honeypot === '1')
+    : (tSec.is_honeypot === 'yes');
   const lpBurned   = tSec.burn_status === 'burn';
   const lpLocked   = Number(tInfo.locked_ratio || 0) > 0;
 
