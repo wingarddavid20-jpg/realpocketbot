@@ -1,0 +1,23 @@
+{
+  "name": "call-gate",
+  "version": "1.0.0",
+  "description": "Local memecoin pre-trade filtration gate — evaluates Solana/EVM tokens against 11 hard-stop rules before any buy.",
+  "main": "gate.js",
+  "bin": {
+    "call-gate": "./gate.js"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "gmgn-cli": "^1.6.0",
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}

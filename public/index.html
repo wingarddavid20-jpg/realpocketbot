@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Call-Gate · Pre-Trade Filter</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0d0d0f;
+      color: #e2e2e6;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 2rem;
+    }
+    header h1 {
+      font-size: 2rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      color: #fff;
+    }
+    header h1 span { color: #7c5cfc; }
+    header p { color: #888; margin-top: 0.4rem; font-size: 0.9rem; }
+
+    .search-box {
+      width: 100%;
+      max-width: 680px;
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 2rem;
+    }
+    .search-box input {
+      flex: 1;
+      padding: 0.8rem 1rem;
+      background: #1a1a22;
+      border: 1px solid #2a2a36;
+      border-radius: 8px;
+      color: #e2e2e6;
+      font-size: 0.95rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .search-box input:focus { border-color: #7c5cfc; }
+    .search-box input::placeholder { color: #555; }
+    .search-box button {
+      padding: 0.8rem 1.4rem;
+      background: #7c5cfc;
+      border: none;
+      border-radius: 8px;
+      color: #fff;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+      white-space: nowrap;
+    }
+    .search-box button:hover { background: #6a4de0; }
+    .search-box button:disabled { background: #3a3a4a; cursor: not-allowed; }
+
+    /* Result card */
+    #result { width: 100%; max-width: 680px; display: none; }
+
+    .verdict-banner {
+      border-radius: 10px 10px 0 0;
+      padding: 1.2rem 1.6rem;
+      display: flex;
+      align-items: center;
+      gap: 0.8rem;
+      font-size: 1.4rem;
+      font-weight: 700;
+    }
+    .verdict-banner.pass { background: #0f3d2a; color: #3ddc84; border: 1px solid #1a6645; }
+    .verdict-banner.skip { background: #3d0f0f; color: #ff5555; border: 1px solid #661a1a; border-bottom: none; }
+
+    .card {
+      background: #1a1a22;
+      border: 1px solid #2a2a36;
+      border-top: none;
+      border-radius: 0 0 10px 10px;
+      padding: 1.4rem;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem 1.5rem;
+      margin-bottom: 1.2rem;
+      font-size: 0.82rem;
+      color: #888;
+    }
+    .meta span { display: flex; align-items: center; gap: 0.3rem; }
+    .meta strong { color: #bbb; }
+
+    .section-title {
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #555;
+      margin-bottom: 0.8rem;
+    }
+
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 0.6rem;
+      margin-bottom: 1.4rem;
+    }
+    .metric {
+      background: #12121a;
+      border: 1px solid #222230;
+      border-radius: 8px;
+      padding: 0.6rem 0.8rem;
+    }
+    .metric .label { font-size: 0.72rem; color: #666; margin-bottom: 0.25rem; }
+    .metric .value { font-size: 0.95rem; font-weight: 600; color: #ddd; }
+    .metric .value.ok    { color: #3ddc84; }
+    .metric .value.warn  { color: #f5a623; }
+    .metric .value.bad   { color: #ff5555; }
+
+    .reasons { list-style: none; display: flex; flex-direction: column; gap: 0.5rem; }
+    .reasons li {
+      background: #200f0f;
+      border: 1px solid #3d1a1a;
+      border-radius: 6px;
+      padding: 0.55rem 0.8rem;
+      font-size: 0.85rem;
+      color: #ff8888;
+      display: flex;
+      gap: 0.5rem;
+      align-items: flex-start;
+    }
+    .reasons li::before { content: '✕'; flex-shrink: 0; color: #ff5555; }
+
+    .spinner {
+      width: 40px; height: 40px;
+      border: 3px solid #2a2a36;
+      border-top-color: #7c5cfc;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      margin: 2rem auto;
+      display: none;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .error-msg {
+      color: #ff5555;
+      background: #200f0f;
+      border: 1px solid #3d1a1a;
+      border-radius: 8px;
+      padding: 1rem;
+      font-size: 0.9rem;
+      max-width: 680px;
+      width: 100%;
+      display: none;
+      margin-bottom: 1rem;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>CALL<span>·</span>GATE</h1>
+    <p>Pre-trade meme coin filter · 11 hard rules</p>
+  </header>
+
+  <div class="search-box">
+    <input id="tokenInput" type="text"
+      placeholder="Solana or EVM token address…"
+      autocomplete="off" spellcheck="false" />
+    <button id="evalBtn" onclick="evaluate()">Scan Token</button>
+  </div>
+
+  <div class="spinner" id="spinner"></div>
+  <div class="error-msg" id="errorMsg"></div>
+  <div id="result"></div>
+
+  <script>
+    const input  = document.getElementById('tokenInput');
+    const btn    = document.getElementById('evalBtn');
+    const result = document.getElementById('result');
+    const spin   = document.getElementById('spinner');
+    const errMsg = document.getElementById('errorMsg');
+
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') evaluate(); });
+
+    function colorValue(key, raw) {
+      const v = String(raw ?? '');
+      const yes = v === 'YES' || v === 'CLEAN' || v === 'NORMAL' || v === 'LOCKED' || v === 'NONE';
+      const no  = v === 'NO'  || v === 'DETECTED' || v === 'CLUSTERED';
+      if (key.includes('%')) {
+        const n = parseFloat(v);
+        if (!isNaN(n)) {
+          if (key === 'Liquidity/MC %') return n >= 10 ? 'ok' : n >= 5 ? 'warn' : 'bad';
+          return n <= 5 ? 'ok' : n <= 20 ? 'warn' : 'bad';
+        }
+      }
+      if (yes) return 'ok';
+      if (no)  return 'bad';
+      return '';
+    }
+
+    async function evaluate() {
+      const addr = input.value.trim();
+      if (!addr) return;
+
+      btn.disabled = true;
+      result.style.display = 'none';
+      errMsg.style.display = 'none';
+      spin.style.display = 'block';
+
+      try {
+        const res  = await fetch('/api/evaluate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ input: addr })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Unknown error');
+        render(data);
+      } catch (err) {
+        errMsg.textContent = '❌ ' + err.message;
+        errMsg.style.display = 'block';
+      } finally {
+        spin.style.display = 'none';
+        btn.disabled = false;
+      }
+    }
+
+    function render(data) {
+      const chain = data.resolvedChain || data.chain || '';
+      const vclass = data.verdict === 'BUY' ? 'pass' : data.verdict === 'GAMBLE' ? 'pass' : 'skip';
+      const vtext = data.verdict === 'BUY' ? '🟢 BUY — Safe to proceed' : data.verdict === 'GAMBLE' ? '🟡 GAMBLE — Small size only' : '🚫 SKIP — Do not trade';
+
+      let html = `
+        <div class="verdict-banner ${vclass}">
+          ${vtext}
+        </div>
+        <div class="card">
+          <div class="meta">
+            ${data.metrics?.Token ? `<span>💎 <strong>Token:</strong> ${data.metrics.Token}</span>` : ''}
+            <span>🔗 <strong>Chain:</strong> ${chain.toUpperCase()}</span>
+            <span>📋 <strong>Address:</strong> ${data.address}</span>
+          </div>`;
+
+      if (data.metrics && Object.keys(data.metrics).length) {
+        html += `<div class="section-title">Metrics</div><div class="metrics-grid">`;
+        for (const [k, v] of Object.entries(data.metrics)) {
+          const cls = colorValue(k, v);
+          html += `<div class="metric">
+            <div class="label">${k}</div>
+            <div class="value ${cls}">${v}</div>
+          </div>`;
+        }
+        html += `</div>`;
+      }
+
+      if (!pass && data.reasons && data.reasons.length) {
+        html += `<div class="section-title">Why it failed</div><ul class="reasons">`;
+        data.reasons.forEach(r => {
+          html += `<li>${r.replace(/[<>]/g, '')}</li>`;
+        });
+        html += `</ul>`;
+      }
+
+      html += `</div>`;
+      result.innerHTML = html;
+      result.style.display = 'block';
+    }
+  </script>
+</body>
+</html>
