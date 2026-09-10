@@ -95,24 +95,41 @@ function extractAddress(text) {
 
 // ─────────────────────────────────────────────────────────────
 //  EVM CHAIN AUTO-DETECTOR
-//  Queries eth, bsc, and base in parallel; picks the chain
-//  that has real data (highest liquidity > 0). Falls back to eth.
+//  1. GMGN race (for supported chains with liquidity)
+//  2. Direct RPC eth_getCode probe (for new chains like Robinhood/Hype)
+//  Falls back to eth only if everything fails.
 // ─────────────────────────────────────────────────────────────
 const EVM_CHAINS = ['eth', 'bsc', 'base', 'robinhood', 'hype', 'hyperliquid'];
+
+// Public RPCs for chains GMGN doesn't support — used to check if a contract exists
+const RPC_PROBE_CHAINS = {
+  'robinhood': 'https://rpc.mainnet.chain.robinhood.com',
+  'hype':      'https://rpc.hyperliquid.xyz/evm',
+};
+
+async function probeRpcForContract(address, chain, rpcUrl) {
+  const res = await axios.post(rpcUrl, {
+    jsonrpc: '2.0', id: 1, method: 'eth_getCode', params: [address, 'latest']
+  }, { timeout: 4000 });
+  const code = res.data?.result;
+  if (code && code !== '0x' && code.length > 4) return chain;
+  throw new Error(`No contract on ${chain}`);
+}
 
 async function detectEvmChain(address) {
   try {
     return await Promise.any([
+      // GMGN race — works for ETH, BSC, Base
       ...EVM_CHAINS.map(c =>
         gmgnCli('info', c, address).then(data => {
           if (Number(data?.liquidity || 0) > 0) return c;
           throw new Error('No liquidity');
         })
       ),
-      axios.get(`https://robinhoodchain.blockscout.com/api/v2/tokens/${address.toLowerCase()}`, { timeout: 6000 }).then(res => {
-        if (res.data && res.data.name) return 'robinhood';
-        throw new Error('Not found on blockscout');
-      })
+      // Direct RPC probe — works for Robinhood, Hype (even brand new tokens)
+      ...Object.entries(RPC_PROBE_CHAINS).map(([chain, rpcUrl]) =>
+        probeRpcForContract(address, chain, rpcUrl)
+      ),
     ]);
   } catch {
     return 'eth'; // fallback
