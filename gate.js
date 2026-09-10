@@ -530,6 +530,34 @@ async function evaluate(address, chain) {
   }
   // If chain was set directly by manual override (e.g. 'robinhood'), it stays as-is.
 
+  // ── 0.5 GeckoTerminal Fallback (if DexScreener blocked) ───────
+  if (!dexData.name || dexData.mc === 0) {
+    const gtChain = resolvedChain === 'hype' ? 'hyperliquid' : (resolvedChain === 'eth' ? 'ethereum' : resolvedChain);
+    try {
+      const gtRes = await axios.get(`https://api.geckoterminal.com/api/v2/networks/${gtChain}/tokens/${address}/pools?page=1`, {
+        headers: { 'Accept': 'application/json' },
+        timeout: 5000
+      });
+      if (gtRes.data && gtRes.data.data && gtRes.data.data.length > 0) {
+        // Find pool with highest liquidity
+        const pool = gtRes.data.data.sort((a,b) => (Number(b.attributes?.reserve_in_usd||0) - Number(a.attributes?.reserve_in_usd||0)))[0];
+        if (pool && pool.attributes) {
+          dexData.chainId = gtChain;
+          dexData.name = pool.attributes.name || '';
+          dexData.symbol = pool.attributes.name?.split(' / ')[0] || '';
+          dexData.liq = Number(pool.attributes.reserve_in_usd || 0);
+          dexData.mc = Number(pool.attributes.market_cap_usd || pool.attributes.fdv_usd || 0);
+          dexData.vol24 = Number(pool.attributes.volume_usd?.h24 || 0);
+          console.log(`[GeckoTerminal] ✅ ${dexData.name} on ${gtChain} — Liq: $${dexData.liq.toLocaleString()} MC: $${dexData.mc.toLocaleString()}`);
+        }
+      } else {
+        console.log(`[GeckoTerminal] ⚠️ No pools found for ${address} on ${gtChain}.`);
+      }
+    } catch (err) {
+      console.warn(`[GeckoTerminal] ⚠️ Fetch failed (${err.message}).`);
+    }
+  }
+
   // ── Fire GMGN + Blockscout + GoPlus in parallel ──────────────
   const [raw, blockscoutData, goPlusData] = await Promise.all([
     fetchTokenData(address, resolvedChain).catch(err => {
