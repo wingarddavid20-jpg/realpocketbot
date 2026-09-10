@@ -333,11 +333,17 @@ async function fetchBlockscoutHolders(address, chain) {
     result.totalHolders = tokenRes.data?.holders_count ? Number(tokenRes.data.holders_count) : null;
 
     if (holderList.length > 0 && totalSupplyRaw > 0n) {
-      result.holders = holderList.map(h => ({
-        address: h.address?.hash || h.address || '',
-        pct: Number(BigInt(h.value || '0') * 10000n / totalSupplyRaw) / 100,
-      }));
-      result.top10Pct = result.holders.slice(0, 10).reduce((s, h) => s + h.pct, 0);
+      result.holders = holderList.map(h => {
+        const addrObj = h.address || {};
+        return {
+          address: addrObj.hash || addrObj || '',
+          pct: Number(BigInt(h.value || '0') * 10000n / totalSupplyRaw) / 100,
+          isContract: addrObj.is_contract === true || addrObj.is_smart_contract === true
+        };
+      });
+      // Ignore DEX pools/smart contracts (or any wallet holding >80% which is the curve pool) 
+      const realHolders = result.holders.filter(h => !h.isContract && h.pct < 80);
+      result.top10Pct = realHolders.slice(0, 10).reduce((s, h) => s + h.pct, 0);
 
       // ── BUNDLER CLUSTER DETECTION ──
       const clusters = {};
