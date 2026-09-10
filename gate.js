@@ -31,7 +31,7 @@ function toChecksumAddress(addr) {
 }
 
 // GMGN-supported chain slugs (hype/hyperliquid not yet supported by gmgn-cli)
-const GMGN_SUPPORTED_CHAINS = new Set(['sol', 'bsc', 'base', 'eth', 'robinhood', 'arc', 'stable', 'solana']);
+const GMGN_SUPPORTED_CHAINS = new Set(['sol', 'bsc', 'base', 'eth', 'arc', 'stable', 'solana']);
 
 // ─────────────────────────────────────────────────────────────
 //  CONSTANTS & CONFIG
@@ -109,7 +109,7 @@ async function detectEvmChain(address) {
           throw new Error('No liquidity');
         })
       ),
-      axios.get(`https://robinhoodchain.blockscout.com/api/v2/tokens/${address.toLowerCase()}`, { timeout: 3000 }).then(res => {
+      axios.get(`https://robinhoodchain.blockscout.com/api/v2/tokens/${address.toLowerCase()}`, { timeout: 6000 }).then(res => {
         if (res.data && res.data.name) return 'robinhood';
         throw new Error('Not found on blockscout');
       })
@@ -313,11 +313,12 @@ async function fetchTokenData(address, chain) {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  BLOCKSCOUT — On-chain holder analytics for unsupported chains
+//  BLOCKSCOUT — On-chain holder analytics + market data for unsupported chains
 // ─────────────────────────────────────────────────────────────
-async function fetchBlockscoutHolders(address, chain) {
+async function fetchBlockscoutData(address, chain) {
   const BLOCKSCOUT_URLS = {
     'robinhood': 'https://robinhoodchain.blockscout.com',
+    'hype':      'https://hyperliquid.blockscout.com',
   };
 
   const baseUrl = BLOCKSCOUT_URLS[chain];
@@ -329,7 +330,12 @@ async function fetchBlockscoutHolders(address, chain) {
     'Accept': 'application/json',
   };
 
-  const result = { top10Pct: null, devHoldPct: null, totalHolders: null, bundlerPct: null, holders: [] };
+  const result = {
+    // Holder data
+    top10Pct: null, devHoldPct: null, totalHolders: null, bundlerPct: null, holders: [],
+    // Market data (NEW — used as DexScreener fallback)
+    name: null, symbol: null, price: 0, marketCap: 0, decimals: 18,
+  };
 
   try {
     const [holdersRes, tokenRes] = await Promise.all([
@@ -337,9 +343,23 @@ async function fetchBlockscoutHolders(address, chain) {
       axios.get(`${baseUrl}/api/v2/tokens/${lowercaseAddr}`, { headers, timeout: 8_000 }),
     ]);
 
+    const tokenData = tokenRes.data || {};
+
+    // ── Market data extraction ──
+    result.name      = tokenData.name || null;
+    result.symbol    = tokenData.symbol || null;
+    result.decimals  = Number(tokenData.decimals || 18);
+    result.price     = Number(tokenData.exchange_rate || 0);
+    result.marketCap = Number(tokenData.circulating_market_cap || 0);
+
+    if (result.name) {
+      console.log(`[Blockscout-${chain}] 📊 Token: ${result.name} ($${result.symbol}) | Price: $${result.price} | MC: $${result.marketCap.toLocaleString()}`);
+    }
+
+    // ── Holder data extraction ──
     const holderList = holdersRes.data?.items || [];
-    const totalSupplyRaw = BigInt(tokenRes.data?.total_supply || '0');
-    result.totalHolders = tokenRes.data?.holders_count ? Number(tokenRes.data.holders_count) : null;
+    const totalSupplyRaw = BigInt(tokenData.total_supply || '0');
+    result.totalHolders = tokenData.holders_count ? Number(tokenData.holders_count) : null;
 
     if (holderList.length > 0 && totalSupplyRaw > 0n) {
       result.holders = holderList.map(h => {
@@ -372,7 +392,7 @@ async function fetchBlockscoutHolders(address, chain) {
       result.bundlerPct = bundlerTotal;
     }
 
-    console.log(`[Blockscout-${chain}] ✅ Top-10: ${result.top10Pct?.toFixed(1)}%  Holders: ${result.totalHolders}  Bundled: ${result.bundlerPct?.toFixed(1) || 0}%`);
+    console.log(`[Blockscout-${chain}] ✅ Top-10: ${result.top10Pct?.toFixed(1) ?? 'N/A'}%  Holders: ${result.totalHolders}  Bundled: ${result.bundlerPct?.toFixed(1) || 0}%`);
   } catch (err) {
     console.warn(`[Blockscout-${chain}] Holder fetch failed: ${err.message}`);
   }
@@ -438,26 +458,16 @@ async function evaluate(address, chain) {
   // ── 0. Auto-resolve pool addresses to token addresses ─────────
   let dexData = { name: '', symbol: '', liq: 0, mc: 0, vol24: 0, m5Buys: 0, m5Sells: 0, m5Change: 0, chainId: '' };
   try {
-    let dexRes;
-    try {
-      // 1. Try direct fetch with spoofed browser headers
-      dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/search?q=${address}`, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'application/json, text/plain, */*',
-          'Origin': 'https://dexscreener.com',
-          'Referer': 'https://dexscreener.com/'
-        },
-        timeout: 5000
-      });
-    } catch (err) {
-      console.log(`[DexScreener] Direct fetch blocked by Cloudflare. Using Proxy...`);
-      // 2. Fallback to an open proxy to bypass Railway IP ban
-      const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent('https://api.dexscreener.com/latest/dex/search?q=' + address)}`;
-      dexRes = await axios.get(proxyUrl, { timeout: 8000 });
-    }
+    const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/search?q=${address}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+      },
+      timeout: 6000
+    });
 
-    if (dexRes.data && dexRes.data.pairs && dexRes.data.pairs.length > 0) {
+    // Validate response is actual JSON, not an HTML error page
+    if (dexRes.data && typeof dexRes.data === 'object' && dexRes.data.pairs && dexRes.data.pairs.length > 0) {
       let matchingPair = dexRes.data.pairs.find(p => p.pairAddress.toLowerCase() === address.toLowerCase());
       if (!matchingPair) {
         matchingPair = dexRes.data.pairs.sort((a,b) => (b.liquidity?.usd||0) - (a.liquidity?.usd||0))[0];
@@ -477,17 +487,20 @@ async function evaluate(address, chain) {
         dexData.m5Buys = Number(matchingPair.txns?.m5?.buys || 0);
         dexData.m5Sells = Number(matchingPair.txns?.m5?.sells || 0);
         dexData.m5Change = Number(matchingPair.priceChange?.m5 || 0);
+        console.log(`[DexScreener] ✅ ${dexData.name} on ${dexData.chainId} — Liq: $${dexData.liq.toLocaleString()} MC: $${dexData.mc.toLocaleString()}`);
       }
+    } else {
+      console.log(`[DexScreener] ⚠️ No pairs found or blocked — will use Blockscout fallback.`);
     }
   } catch (err) {
-    console.error(`[Auto-Resolve] Failed to check DexScreener: ${err.message}`);
+    console.warn(`[DexScreener] ⚠️ Fetch failed (${err.message}) — will use Blockscout fallback.`);
   }
 
-  // ── Resolve chain first so we can route correctly ─────────────
+  // ── Resolve chain ─────────────────────────────────────────────
+  //  Priority: manual override → DexScreener chainId → Blockscout probe → GMGN race → eth fallback
   let resolvedChain = chain;
   if (chain === 'evm') {
     if (dexData.chainId) {
-      // Map DexScreener chain slugs to GMGN chain slugs
       const cid = dexData.chainId.toLowerCase();
       if (cid === 'ethereum') resolvedChain = 'eth';
       else if (cid === 'hyperliquid' || cid === 'hyperevm') resolvedChain = 'hype';
@@ -495,17 +508,18 @@ async function evaluate(address, chain) {
       console.log(`[chain-detect] DexScreener → ${resolvedChain}`);
     } else {
       resolvedChain = await detectEvmChain(address);
-      console.log(`[chain-detect] GMGN Fallback → ${resolvedChain}`);
+      console.log(`[chain-detect] Fallback → ${resolvedChain}`);
     }
   }
+  // If chain was set directly by manual override (e.g. 'robinhood'), it stays as-is.
 
   // ── Fire GMGN + Blockscout + GoPlus in parallel ──────────────
   const [raw, blockscoutData, goPlusData] = await Promise.all([
     fetchTokenData(address, resolvedChain).catch(err => {
-      console.warn(`[GMGN] Failed to fetch token data (${err.message}). Falling back strictly to DexScreener.`);
+      console.warn(`[GMGN] Failed (${err.message}). Using DexScreener/Blockscout.`);
       return {};
     }),
-    fetchBlockscoutHolders(address, resolvedChain),
+    fetchBlockscoutData(address, resolvedChain),
     fetchGoPlusSecurity(address, resolvedChain)
   ]);
 
@@ -518,13 +532,22 @@ async function evaluate(address, chain) {
   const dev    = tInfo.dev   || {};
 
   // ── Metric extraction ──────────────────────────────────────
-  const tokenSymbol = tInfo.token?.symbol || tInfo.symbol || dexData.symbol || 'UNKNOWN';
-  const tokenName   = tInfo.token?.name || tInfo.name || dexData.name || '';
+  //  Priority: GMGN → DexScreener → Blockscout
+  const tokenSymbol = tInfo.token?.symbol || tInfo.symbol || dexData.symbol || blockscoutData?.symbol || 'UNKNOWN';
+  const tokenName   = tInfo.token?.name || tInfo.name || dexData.name || blockscoutData?.name || '';
   
   const currentPrice = Number(price.price || 0);
   const circSupply   = Number(tInfo.circulating_supply || 0);
-  // PREFER DexScreener for real-time Market Cap and Liquidity
-  const marketCapUSD = dexData.mc > 0 ? dexData.mc : ((currentPrice * circSupply > 0) ? (currentPrice * circSupply) : 0);
+
+  // Market Cap: DexScreener → GMGN → Blockscout
+  let marketCapUSD = dexData.mc > 0 ? dexData.mc
+    : ((currentPrice * circSupply > 0) ? (currentPrice * circSupply) : 0);
+  if (marketCapUSD === 0 && blockscoutData?.marketCap > 0) {
+    marketCapUSD = blockscoutData.marketCap;
+    console.log(`[Blockscout] 📊 Using Blockscout market cap: $${marketCapUSD.toLocaleString()}`);
+  }
+
+  // Liquidity: DexScreener → GMGN → (no Blockscout equivalent, but curve chains skip liq rules)
   const liquidityUSD = dexData.liq > 0 ? dexData.liq : Number(tInfo.liquidity || 0);
 
   // ── Holder data: prefer Blockscout (real on-chain) over GMGN for unsupported chains ──
