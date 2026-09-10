@@ -429,7 +429,25 @@ async function evaluate(address, chain) {
   // ── 0. Auto-resolve pool addresses to token addresses ─────────
   let dexData = { name: '', symbol: '', liq: 0, mc: 0, vol24: 0, m5Buys: 0, m5Sells: 0, m5Change: 0, chainId: '' };
   try {
-    const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/search?q=${address}`);
+    let dexRes;
+    try {
+      // 1. Try direct fetch with spoofed browser headers
+      dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/search?q=${address}`, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'application/json, text/plain, */*',
+          'Origin': 'https://dexscreener.com',
+          'Referer': 'https://dexscreener.com/'
+        },
+        timeout: 5000
+      });
+    } catch (err) {
+      console.log(`[DexScreener] Direct fetch blocked by Cloudflare. Using Proxy...`);
+      // 2. Fallback to an open proxy to bypass Railway IP ban
+      const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent('https://api.dexscreener.com/latest/dex/search?q=' + address)}`;
+      dexRes = await axios.get(proxyUrl, { timeout: 8000 });
+    }
+
     if (dexRes.data && dexRes.data.pairs && dexRes.data.pairs.length > 0) {
       let matchingPair = dexRes.data.pairs.find(p => p.pairAddress.toLowerCase() === address.toLowerCase());
       if (!matchingPair) {
