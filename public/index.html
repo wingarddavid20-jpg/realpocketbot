@@ -241,6 +241,8 @@
       const vclass = data.verdict === 'BUY' ? 'pass' : data.verdict === 'GAMBLE' ? 'pass' : 'skip';
       const vtext = data.verdict === 'BUY' ? '🟢 BUY — Safe to proceed' : data.verdict === 'GAMBLE' ? '🟡 GAMBLE — Small size only' : '🚫 SKIP — Do not trade';
 
+      const pass = data.verdict === 'BUY' || data.verdict === 'GAMBLE';
+
       let html = `
         <div class="verdict-banner ${vclass}">
           ${vtext}
@@ -255,6 +257,7 @@
       if (data.metrics && Object.keys(data.metrics).length) {
         html += `<div class="section-title">Metrics</div><div class="metrics-grid">`;
         for (const [k, v] of Object.entries(data.metrics)) {
+          if (k === 'Token') continue; // Hide Token from grid since it's in the meta header
           const cls = colorValue(k, v);
           html += `<div class="metric">
             <div class="label">${k}</div>
@@ -262,6 +265,38 @@
           </div>`;
         }
         html += `</div>`;
+      }
+
+      // Add Quick Buy Buttons if it passed
+      if (pass) {
+        let buyLink = '';
+        let buttonText = '';
+        
+        if (chain === 'solana' || chain === 'sol') {
+          buyLink = `https://t.me/solana_trojanbot?start=r-memescan-${data.address}`;
+          buttonText = '🟣 Buy with Trojan';
+        } else {
+          buyLink = `https://t.me/based_eth_bot?start=b_${data.address}`;
+          buttonText = '🔵 Buy with BasedBot';
+        }
+
+        html += `
+          <div style="margin-top: 1rem; margin-bottom: 1.5rem; text-align: center;">
+            <a href="${buyLink}" target="_blank" style="
+              display: inline-block;
+              background: #2a2a36;
+              color: #fff;
+              text-decoration: none;
+              padding: 0.8rem 1.5rem;
+              border-radius: 8px;
+              font-weight: 600;
+              border: 1px solid #3a3a4a;
+              transition: all 0.2s;
+            " onmouseover="this.style.background='#3a3a4a'; this.style.borderColor='#7c5cfc';" onmouseout="this.style.background='#2a2a36'; this.style.borderColor='#3a3a4a';">
+              ⚡ ${buttonText}
+            </a>
+          </div>
+        `;
       }
 
       if (!pass && data.reasons && data.reasons.length) {
