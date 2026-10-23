@@ -1,4 +1,4 @@
-//! Real.xyz Telegram Trading Bot
+//! Pocket Real - Telegram Perp Trading Bot for Real.xyz
 //!
 //! A Telegram bot that interfaces with the Real Markets perp DEX on IOTA via
 //! the official Real.xyz Rust SDK. Private key and object IDs are loaded from
@@ -46,7 +46,7 @@ async fn run_bot() -> anyhow::Result<()> {
         .compact()
         .init();
 
-    info!("Starting Real.xyz Telegram trading bot…");
+    info!("Starting Pocket Real Telegram trading bot…");
 
     // Load and validate configuration from environment
     let cfg = config::Config::from_env().context("failed to load configuration")?;

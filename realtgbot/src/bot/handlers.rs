@@ -445,7 +445,8 @@ async fn show_main_menu(
     };
 
     let text = format!(
-        "🤖 *Real.xyz Trading Bot*\n\n\
+        "💼 *Pocket Real*\n\
+         _Fast & Secure Perp Trading on IOTA_\n\n\
          Network: `{}`\n\
          {}\n\n\
          Select an option below:",
@@ -1038,7 +1039,7 @@ async fn cmd_connect(
         state.set_session(chat_id, pending).await;
         bot.send_message(
             chat_id,
-            "🔐 *Connect Your Real.xyz Wallet*\n\n\
+            "🔐 *Connect to Pocket Real*\n\n\
              Please reply with your IOTA private key (`iotaprivkey1...`).\n\n\
              🛡️ *Security Guarantees:*\n\
              • Your message will be **instantly deleted** upon receipt.\n\
@@ -1708,7 +1709,7 @@ async fn cmd_help(bot: &Bot, chat_id: ChatId, user_id: u64, state: &BotState) ->
     };
 
     let msg = format!(
-        "🤖 *Real.xyz Trading Bot*\n\n\
+        "💼 *Pocket Real*\n\n\
          {}\n\n\
          *Available Commands:*\n\
          • `/start` — Open interactive trading menu\n\
@@ -1847,7 +1848,7 @@ async fn cmd_admin(
     let total_vol = state.trading.get_all_users_volume(&all_users).await.unwrap_or(0.0);
 
     let text = format!(
-        "👑 *Real.xyz Bot Admin Dashboard*\n\n\
+        "👑 *Pocket Real Admin Dashboard*\n\n\
          • *Total Registered Users:* `{total_users}`\n\
          • *Active Users (7d):* `{active_users}`\n\
          • *Total Traded Volume:* `${}`\n\n\

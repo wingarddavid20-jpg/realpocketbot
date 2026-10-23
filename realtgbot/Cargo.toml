@@ -2,6 +2,7 @@
 name = "realtgbot"
 version = "0.1.0"
 edition = "2021"
+description = "Pocket Real - Telegram DEX Trading Bot for Real.xyz on IOTA"
 
 [[bin]]
 name = "realtgbot"
