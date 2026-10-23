@@ -1,0 +1,11 @@
+services:
+  realtgbot:
+    build: .
+    container_name: realtgbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Mount persistent storage files so data persists across rebuilds
+      - ./users.json:/app/users.json
+      - ./alerts.json:/app/alerts.json

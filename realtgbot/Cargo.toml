@@ -1,0 +1,49 @@
+[package]
+name = "realtgbot"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "realtgbot"
+path = "src/main.rs"
+
+[dependencies]
+# Real Markets SDK (git dependency)
+sdk = { git = "https://github.com/realmarkets/rust-sdk", package = "sdk" }
+
+# Telegram bot framework
+teloxide = { version = "0.13", features = ["macros", "throttle"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Environment / config
+dotenvy = "0.15"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+tokio-util = { version = "0.7", features = ["full"] }
+reqwest = { version = "0.11", features = ["json"] }
+
+# Cryptography & Zeroization
+aes-gcm = "0.10"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+sha2 = "0.10"
+
+# Unify fastcrypto dependencies so crates.io and git sub-dependencies match the exact commit used by iota
+[patch.crates-io]
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "47f8f6b747900bbc1662c4d4eecd2f7e7a29e16a" }
+fastcrypto-derive = { git = "https://github.com/MystenLabs/fastcrypto", rev = "47f8f6b747900bbc1662c4d4eecd2f7e7a29e16a" }
