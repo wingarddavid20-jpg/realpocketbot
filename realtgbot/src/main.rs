@@ -68,6 +68,21 @@ async fn run_bot() -> anyhow::Result<()> {
     let initial_markets = trading_client.get_markets().await;
     info!(count = initial_markets.len(), "Preloaded live markets from indexer");
 
+    // Optional health check server for cloud container hosts (Hugging Face Spaces, Render, etc.)
+    let port = std::env::var("PORT").unwrap_or_else(|_| "7860".to_string());
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        if let Ok(listener) = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await {
+            info!(port = %port, "Cloud health check listener active");
+            loop {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 15\r\n\r\nPocket Real OK\n";
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                }
+            }
+        }
+    });
+
     // Start the Telegram bot (blocks until shutdown)
     bot::run(cfg, trading_client).await
 }

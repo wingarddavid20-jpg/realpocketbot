@@ -21,8 +21,6 @@ RUN cargo build --release --bin realtgbot
 # --- Runtime Stage ---
 FROM debian:bullseye-slim
 
-WORKDIR /app
-
 # Install runtime SSL certificates
 RUN apt-get update && apt-get install -y \
     ca-certificates \
@@ -30,11 +28,23 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Hugging Face Spaces user with UID 1000
+RUN useradd -m -u 1000 user
+ENV HOME=/home/user \
+    PORT=7860
+
+WORKDIR /app
+
+RUN chown -R user:user /app
+USER user
+
 # Copy compiled binary from builder
-COPY --from=builder /usr/src/realtgbot/target/release/realtgbot /app/realtgbot
+COPY --from=builder --chown=user:user /usr/src/realtgbot/target/release/realtgbot /app/realtgbot
 
 # Ensure executable permissions
 RUN chmod +x /app/realtgbot
+
+EXPOSE 7860
 
 # Run the trading bot
 CMD ["/app/realtgbot"]
