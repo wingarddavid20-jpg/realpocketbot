@@ -1,5 +1,5 @@
 # --- Build Stage ---
-FROM rust:1.80-bullseye AS builder
+FROM rust:1.80-bookworm AS builder
 
 WORKDIR /usr/src/realtgbot
 
@@ -19,12 +19,12 @@ COPY realtgbot .
 RUN cargo build --release --bin realtgbot
 
 # --- Runtime Stage ---
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 # Install runtime SSL certificates
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    libssl1.1 \
+    libssl3 \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
