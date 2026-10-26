@@ -33,10 +33,10 @@ RUN useradd -m -u 1000 user
 ENV HOME=/home/user \
     PORT=7860
 
-WORKDIR /app
-
-RUN chown -R user:user /app
+RUN mkdir -p /data && chown -R user:user /data /app
 USER user
+ENV DATA_DIR=/data
+WORKDIR /app
 
 # Copy compiled binary from builder
 COPY --from=builder --chown=user:user /usr/src/realtgbot/target/release/realtgbot /app/realtgbot

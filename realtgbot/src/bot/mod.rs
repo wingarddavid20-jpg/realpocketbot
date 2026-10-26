@@ -32,6 +32,7 @@ pub async fn run(cfg: Config, trading: TradingClient) -> anyhow::Result<()> {
 
     // Persistent stores for encrypted keys and price alerts (supports configurable DATA_DIR e.g. /data)
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| ".".into());
+    info!(data_dir = %data_dir, "Persistent storage directory configured");
     let users_path = format!("{data_dir}/users.json");
     let alerts_path = format!("{data_dir}/alerts.json");
 
