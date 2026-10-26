@@ -1274,8 +1274,11 @@ async fn execute_button_close(
     };
 
     let close_fraction = (pct / 100.0).clamp(0.01, 1.0);
-    let raw_close_qty = pos.size * close_fraction;
-    let qty_str = format_asset_qty(&sym_upper, raw_close_qty);
+    let raw_close_qty = if pct >= 99.9 { pos.size } else { pos.size * close_fraction };
+    let mut qty_str = format_asset_qty(&sym_upper, raw_close_qty);
+    if qty_str.parse::<f64>().unwrap_or(0.0) <= 0.0 && pos.size > 0.0 {
+        qty_str = format_asset_qty(&sym_upper, pos.size.min(0.001));
+    }
 
     let is_pos_long = pos.direction.eq_ignore_ascii_case("long") || pos.direction.eq_ignore_ascii_case("buy");
     let close_side = if is_pos_long { "Sell" } else { "Buy" };
@@ -1576,7 +1579,7 @@ async fn execute_conversational_trade(
         bot.send_message(
             chat_id,
             format!(
-                "❌ Order size for {symbol} ({qty_str}) is too small. Please increase your USD amount or leverage."
+                "❌ Order size for {symbol} ({qty_str}) is too small (minimum 0.001). Please increase your USD amount or leverage."
             ),
         )
         .reply_markup(back_to_main_keyboard())
@@ -2063,8 +2066,11 @@ async fn cmd_close(
     };
 
     let close_fraction = (percentage / 100.0).clamp(0.01, 1.0);
-    let raw_close_qty = pos.size * close_fraction;
-    let qty_str = format_asset_qty(&symbol, raw_close_qty);
+    let raw_close_qty = if percentage >= 99.9 { pos.size } else { pos.size * close_fraction };
+    let mut qty_str = format_asset_qty(&symbol, raw_close_qty);
+    if qty_str.parse::<f64>().unwrap_or(0.0) <= 0.0 && pos.size > 0.0 {
+        qty_str = format_asset_qty(&symbol, pos.size.min(0.001));
+    }
 
     let is_pos_long = pos.direction.eq_ignore_ascii_case("long") || pos.direction.eq_ignore_ascii_case("buy");
     let close_side = if is_pos_long { "Sell" } else { "Buy" };
@@ -2190,13 +2196,15 @@ fn parse_order_args(
                     state.available_markets_summary()
                 ))
             })?;
-            Ok((market, qty.to_string(), price.to_string()))
+            let clean_qty = crate::trading::TradingClient::sanitize_order_quantity(qty);
+            Ok((market, clean_qty, price.to_string()))
         }
         [qty, price] => {
             let market = state
                 .resolve_market("")
                 .ok_or(BotError::NoDefaultMarket)?;
-            Ok((market, qty.to_string(), price.to_string()))
+            let clean_qty = crate::trading::TradingClient::sanitize_order_quantity(qty);
+            Ok((market, clean_qty, price.to_string()))
         }
         _ => Err(BotError::InvalidArg(
             "Usage: /long <market> <size> <price>\nExample: /long btc 0.1 82000".into(),
@@ -2254,23 +2262,11 @@ fn format_usd(val: f64) -> String {
     }
 }
 
-fn format_asset_qty(symbol: impl AsRef<str>, qty: f64) -> String {
-    match symbol.as_ref().to_uppercase().as_str() {
-        "BTC" => format!("{:.3}", qty),
-        "ETH" => format!("{:.2}", qty),
-        "SOL" => format!("{:.1}", qty),
-        _ => {
-            if qty >= 100.0 {
-                format!("{:.0}", qty)
-            } else if qty >= 1.0 {
-                format!("{:.2}", qty)
-            } else if qty >= 0.01 {
-                format!("{:.3}", qty)
-            } else {
-                format!("{:.4}", qty)
-            }
-        }
-    }
+/// Format order quantity (size) rounded to 3 decimal places before submitting to Real.xyz.
+/// Prevents Real.xyz engine error 121 (OrderQuantityHasTooManyDecimalPlaces).
+fn format_asset_qty(_symbol: impl AsRef<str>, qty: f64) -> String {
+    let rounded = (qty * 1000.0).round() / 1000.0;
+    format!("{:.3}", rounded)
 }
 
 fn format_volume(val: f64) -> String {

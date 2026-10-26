@@ -1165,12 +1165,24 @@ impl TradingClient {
 
     // ─── Public Order Operations ────────────────────────────────────────────
 
+    /// Ensure order quantity is rounded to 3 decimal places before submitting to Real.xyz.
+    /// Prevents Real.xyz engine error 121 (OrderQuantityHasTooManyDecimalPlaces).
+    pub fn sanitize_order_quantity(qty: &str) -> String {
+        if let Ok(val) = qty.parse::<f64>() {
+            let rounded = (val * 1000.0).round() / 1000.0;
+            format!("{:.3}", rounded)
+        } else {
+            qty.to_string()
+        }
+    }
+
     /// Place a market buy (long) order with immediate-or-cancel execution.
     pub async fn place_market_long(
         &self,
         market: &str,
         quantity: &str,
     ) -> BotResult<OrderResult> {
+        let clean_qty = Self::sanitize_order_quantity(quantity);
         let coid = Uuid::new_v4().to_string();
         let account_id = self.get_effective_account_id().await;
         let order = SubmitOrderRequest::builder()
@@ -1178,7 +1190,7 @@ impl TradingClient {
             .account(&account_id)
             .buy()
             .market_order()
-            .quantity(quantity)
+            .quantity(&clean_qty)
             .immediate_or_cancel()
             .client_order_id(&coid)
             .build()
@@ -1193,7 +1205,7 @@ impl TradingClient {
         drop(client);
 
         debug!("place_market_long report: {report:?}");
-        self.parse_order_result(report, "Buy (Market)", quantity, "Market", market, &coid)
+        self.parse_order_result(report, "Buy (Market)", &clean_qty, "Market", market, &coid)
     }
 
     /// Place a market sell (short) order with immediate-or-cancel execution.
@@ -1202,6 +1214,7 @@ impl TradingClient {
         market: &str,
         quantity: &str,
     ) -> BotResult<OrderResult> {
+        let clean_qty = Self::sanitize_order_quantity(quantity);
         let coid = Uuid::new_v4().to_string();
         let account_id = self.get_effective_account_id().await;
         let order = SubmitOrderRequest::builder()
@@ -1209,7 +1222,7 @@ impl TradingClient {
             .account(&account_id)
             .sell()
             .market_order()
-            .quantity(quantity)
+            .quantity(&clean_qty)
             .immediate_or_cancel()
             .client_order_id(&coid)
             .build()
@@ -1224,7 +1237,7 @@ impl TradingClient {
         drop(client);
 
         debug!("place_market_short report: {report:?}");
-        self.parse_order_result(report, "Sell (Market)", quantity, "Market", market, &coid)
+        self.parse_order_result(report, "Sell (Market)", &clean_qty, "Market", market, &coid)
     }
 
     /// Place a reduce-only order to close an open position (market or limit).
@@ -1235,6 +1248,7 @@ impl TradingClient {
         quantity: &str,
         price: Option<&str>,
     ) -> BotResult<OrderResult> {
+        let clean_qty = Self::sanitize_order_quantity(quantity);
         let coid = Uuid::new_v4().to_string();
         let account_id = self.get_effective_account_id().await;
         let mut builder = SubmitOrderRequest::builder();
@@ -1253,7 +1267,7 @@ impl TradingClient {
         }
 
         let order = builder
-            .quantity(quantity)
+            .quantity(&clean_qty)
             .reduce_only(true)
             .client_order_id(&coid)
             .build()
@@ -1269,7 +1283,7 @@ impl TradingClient {
 
         debug!("place_close_order report: {report:?}");
         let price_label = price.unwrap_or("Market");
-        self.parse_order_result(report, side, quantity, price_label, market, &coid)
+        self.parse_order_result(report, side, &clean_qty, price_label, market, &coid)
     }
 
     /// Place a limit buy (long) order.
@@ -1279,6 +1293,7 @@ impl TradingClient {
         quantity: &str,
         price: &str,
     ) -> BotResult<OrderResult> {
+        let clean_qty = Self::sanitize_order_quantity(quantity);
         let coid = Uuid::new_v4().to_string();
         let account_id = self.get_effective_account_id().await;
         let order = SubmitOrderRequest::builder()
@@ -1286,7 +1301,7 @@ impl TradingClient {
             .account(&account_id)
             .buy()
             .limit_order(price)
-            .quantity(quantity)
+            .quantity(&clean_qty)
             .good_till_cancel()
             .client_order_id(&coid)
             .build()
@@ -1301,7 +1316,7 @@ impl TradingClient {
         drop(client);
 
         debug!("submit_order report: {report:?}");
-        self.parse_order_result(report, "Buy", quantity, price, market, &coid)
+        self.parse_order_result(report, "Buy", &clean_qty, price, market, &coid)
     }
 
     /// Place a limit sell (short) order.
@@ -1311,6 +1326,7 @@ impl TradingClient {
         quantity: &str,
         price: &str,
     ) -> BotResult<OrderResult> {
+        let clean_qty = Self::sanitize_order_quantity(quantity);
         let coid = Uuid::new_v4().to_string();
         let account_id = self.get_effective_account_id().await;
         let order = SubmitOrderRequest::builder()
@@ -1318,7 +1334,7 @@ impl TradingClient {
             .account(&account_id)
             .sell()
             .limit_order(price)
-            .quantity(quantity)
+            .quantity(&clean_qty)
             .good_till_cancel()
             .client_order_id(&coid)
             .build()
@@ -1333,7 +1349,7 @@ impl TradingClient {
         drop(client);
 
         debug!("submit_order report: {report:?}");
-        self.parse_order_result(report, "Sell", quantity, price, market, &coid)
+        self.parse_order_result(report, "Sell", &clean_qty, price, market, &coid)
     }
 
     /// Cancel all open orders in a given market.
@@ -1401,13 +1417,14 @@ impl TradingClient {
         market: &str,
         quantity: &str,
     ) -> BotResult<OrderResult> {
+        let clean_qty = Self::sanitize_order_quantity(quantity);
         let coid = Uuid::new_v4().to_string();
         let order = SubmitOrderRequest::builder()
             .market(market)
             .account(account_id)
             .buy()
             .market_order()
-            .quantity(quantity)
+            .quantity(&clean_qty)
             .immediate_or_cancel()
             .client_order_id(&coid)
             .build()
@@ -1421,7 +1438,7 @@ impl TradingClient {
             .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
         drop(client);
 
-        self.parse_order_result(report, "Buy (Market)", quantity, "Market", market, &coid)
+        self.parse_order_result(report, "Buy (Market)", &clean_qty, "Market", market, &coid)
     }
 
     pub async fn place_user_market_short(
@@ -1431,13 +1448,14 @@ impl TradingClient {
         market: &str,
         quantity: &str,
     ) -> BotResult<OrderResult> {
+        let clean_qty = Self::sanitize_order_quantity(quantity);
         let coid = Uuid::new_v4().to_string();
         let order = SubmitOrderRequest::builder()
             .market(market)
             .account(account_id)
             .sell()
             .market_order()
-            .quantity(quantity)
+            .quantity(&clean_qty)
             .immediate_or_cancel()
             .client_order_id(&coid)
             .build()
@@ -1451,7 +1469,7 @@ impl TradingClient {
             .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
         drop(client);
 
-        self.parse_order_result(report, "Sell (Market)", quantity, "Market", market, &coid)
+        self.parse_order_result(report, "Sell (Market)", &clean_qty, "Market", market, &coid)
     }
 
     pub async fn place_user_limit_long(
@@ -1462,13 +1480,14 @@ impl TradingClient {
         quantity: &str,
         price: &str,
     ) -> BotResult<OrderResult> {
+        let clean_qty = Self::sanitize_order_quantity(quantity);
         let coid = Uuid::new_v4().to_string();
         let order = SubmitOrderRequest::builder()
             .market(market)
             .account(account_id)
             .buy()
             .limit_order(price)
-            .quantity(quantity)
+            .quantity(&clean_qty)
             .good_till_cancel()
             .client_order_id(&coid)
             .build()
@@ -1482,7 +1501,7 @@ impl TradingClient {
             .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
         drop(client);
 
-        self.parse_order_result(report, "Buy", quantity, price, market, &coid)
+        self.parse_order_result(report, "Buy", &clean_qty, price, market, &coid)
     }
 
     pub async fn place_user_limit_short(
@@ -1493,13 +1512,14 @@ impl TradingClient {
         quantity: &str,
         price: &str,
     ) -> BotResult<OrderResult> {
+        let clean_qty = Self::sanitize_order_quantity(quantity);
         let coid = Uuid::new_v4().to_string();
         let order = SubmitOrderRequest::builder()
             .market(market)
             .account(account_id)
             .sell()
             .limit_order(price)
-            .quantity(quantity)
+            .quantity(&clean_qty)
             .good_till_cancel()
             .client_order_id(&coid)
             .build()
@@ -1513,7 +1533,7 @@ impl TradingClient {
             .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
         drop(client);
 
-        self.parse_order_result(report, "Sell", quantity, price, market, &coid)
+        self.parse_order_result(report, "Sell", &clean_qty, price, market, &coid)
     }
 
     pub async fn place_user_close_order(
@@ -1525,6 +1545,7 @@ impl TradingClient {
         quantity: &str,
         price: Option<&str>,
     ) -> BotResult<OrderResult> {
+        let clean_qty = Self::sanitize_order_quantity(quantity);
         let coid = Uuid::new_v4().to_string();
         let mut builder = SubmitOrderRequest::builder();
         builder = builder.market(market).account(account_id);
@@ -1542,7 +1563,7 @@ impl TradingClient {
         }
 
         let order = builder
-            .quantity(quantity)
+            .quantity(&clean_qty)
             .reduce_only(true)
             .client_order_id(&coid)
             .build()
@@ -1557,7 +1578,7 @@ impl TradingClient {
         drop(client);
 
         let price_label = price.unwrap_or("Market");
-        self.parse_order_result(report, side, quantity, price_label, market, &coid)
+        self.parse_order_result(report, side, &clean_qty, price_label, market, &coid)
     }
 
     pub async fn cancel_user_all_orders(
