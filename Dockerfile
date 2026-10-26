@@ -33,7 +33,7 @@ RUN useradd -m -u 1000 user
 ENV HOME=/home/user \
     PORT=7860
 
-RUN mkdir -p /data && chown -R user:user /data /app
+RUN mkdir -p /data /app && chown -R user:user /data /app
 USER user
 ENV DATA_DIR=/data
 WORKDIR /app
