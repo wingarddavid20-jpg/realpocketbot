@@ -988,7 +988,7 @@ async fn handle_cancel_order_button(
     }
 
     let market_key = parts[0];
-    let market_id = state.trading.get_market_id(market_key).unwrap_or_else(|| market_key.to_string());
+    let market_id = state.trading.resolve_market(market_key).unwrap_or_else(|| market_key.to_string());
     let order_id: u128 = match parts[1].parse::<u128>() {
         Ok(id) => id,
         Err(_) => {

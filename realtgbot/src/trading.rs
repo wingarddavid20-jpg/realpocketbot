@@ -1022,6 +1022,11 @@ impl TradingClient {
         }
     }
 
+    /// Alias for `resolve_market`.
+    pub fn get_market_id(&self, input: &str) -> Option<String> {
+        self.resolve_market(input)
+    }
+
     /// Resolve a market ID to its display asset name (e.g. "BTC", "ETH", "SOL", "HYPE").
     pub fn get_market_name(&self, market_id: &str) -> String {
         if let Some(name) = get_cached_market_name(market_id) {
