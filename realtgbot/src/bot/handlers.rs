@@ -1274,7 +1274,7 @@ async fn execute_button_close(
     };
 
     let decimals = crate::trading::get_cached_market_decimals(&sym_upper);
-    let min_size = 1.0 / 10_f64.powi(decimals as i32);
+    let min_size = crate::trading::get_cached_market_lot_size(&sym_upper);
     let close_fraction = (pct / 100.0).clamp(0.01, 1.0);
     let raw_close_qty = if pct >= 99.9 { pos.size } else { pos.size * close_fraction };
     let (mut qty_str, rounded_close_qty) = crate::trading::round_qty_to_decimals(raw_close_qty, decimals);
@@ -1579,13 +1579,9 @@ async fn execute_conversational_trade(
     let (qty_str, rounded_qty) = crate::trading::round_qty_to_decimals(raw_qty, decimals);
 
     if rounded_qty <= 0.0 {
-        let min_size = 1.0 / 10_f64.powi(decimals as i32);
         bot.send_message(
             chat_id,
-            format!(
-                "❌ Order size for {symbol} is too small (minimum {min_size:.decimals$}). Please increase your USD amount or leverage.",
-                decimals = decimals
-            ),
+            format!("❌ Order size for {symbol} is too small. Please increase your USD amount or leverage."),
         )
         .reply_markup(back_to_main_keyboard())
         .await?;
@@ -2096,7 +2092,7 @@ async fn cmd_close(
     };
 
     let decimals = crate::trading::get_cached_market_decimals(&symbol);
-    let min_size = 1.0 / 10_f64.powi(decimals as i32);
+    let min_size = crate::trading::get_cached_market_lot_size(&symbol);
     let close_fraction = (percentage / 100.0).clamp(0.01, 1.0);
     let raw_close_qty = if percentage >= 99.9 { pos.size } else { pos.size * close_fraction };
     let (mut qty_str, rounded_close_qty) = crate::trading::round_qty_to_decimals(raw_close_qty, decimals);
@@ -2234,13 +2230,15 @@ fn parse_order_input(
                     state.available_markets_summary()
                 ))
             })?;
-            let (clean_qty, decimals, rounded) = crate::trading::sanitize_order_quantity_for_market(&market, qty);
+            let (clean_qty, _decimals, rounded) = crate::trading::sanitize_order_quantity_for_market(&market, qty);
             if rounded <= 0.0 {
-                let min_size = 1.0 / 10_f64.powi(decimals as i32);
-                return Err(BotError::InvalidArg(format!(
-                    "Order size must be at least {min_size:.decimals$}",
-                    decimals = decimals
-                )));
+                let min_lot = crate::trading::get_cached_market_lot_size(&market);
+                let err_msg = if min_lot > 0.0 {
+                    format!("Order size must be at least {min_lot}")
+                } else {
+                    "Order size must be greater than 0.".into()
+                };
+                return Err(BotError::InvalidArg(err_msg));
             }
             Ok(ParsedOrderArgs::Limit {
                 market,
@@ -2250,13 +2248,15 @@ fn parse_order_input(
         }
         [arg1, arg2] => {
             if let Some(market) = state.resolve_market(arg1) {
-                let (clean_qty, decimals, rounded) = crate::trading::sanitize_order_quantity_for_market(&market, arg2);
+                let (clean_qty, _decimals, rounded) = crate::trading::sanitize_order_quantity_for_market(&market, arg2);
                 if rounded <= 0.0 {
-                    let min_size = 1.0 / 10_f64.powi(decimals as i32);
-                    return Err(BotError::InvalidArg(format!(
-                        "Order size must be at least {min_size:.decimals$}",
-                        decimals = decimals
-                    )));
+                    let min_lot = crate::trading::get_cached_market_lot_size(&market);
+                    let err_msg = if min_lot > 0.0 {
+                        format!("Order size must be at least {min_lot}")
+                    } else {
+                        "Order size must be greater than 0.".into()
+                    };
+                    return Err(BotError::InvalidArg(err_msg));
                 }
                 Ok(ParsedOrderArgs::Market {
                     market,
@@ -2266,13 +2266,15 @@ fn parse_order_input(
                 let market = state
                     .resolve_market("")
                     .ok_or(BotError::NoDefaultMarket)?;
-                let (clean_qty, decimals, rounded) = crate::trading::sanitize_order_quantity_for_market(&market, arg1);
+                let (clean_qty, _decimals, rounded) = crate::trading::sanitize_order_quantity_for_market(&market, arg1);
                 if rounded <= 0.0 {
-                    let min_size = 1.0 / 10_f64.powi(decimals as i32);
-                    return Err(BotError::InvalidArg(format!(
-                        "Order size must be at least {min_size:.decimals$}",
-                        decimals = decimals
-                    )));
+                    let min_lot = crate::trading::get_cached_market_lot_size(&market);
+                    let err_msg = if min_lot > 0.0 {
+                        format!("Order size must be at least {min_lot}")
+                    } else {
+                        "Order size must be greater than 0.".into()
+                    };
+                    return Err(BotError::InvalidArg(err_msg));
                 }
                 Ok(ParsedOrderArgs::Limit {
                     market,
