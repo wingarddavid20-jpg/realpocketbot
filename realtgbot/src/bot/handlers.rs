@@ -3,7 +3,7 @@
 //! Handlers call `TradingClient` methods and format results for Telegram.
 //! No SDK types are used here; all trading logic lives in `trading.rs`.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use teloxide::{
     prelude::*,
     types::{CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode},
@@ -170,6 +170,17 @@ pub fn order_placed_keyboard(symbol: &str) -> InlineKeyboardMarkup {
         ],
         vec![
             InlineKeyboardButton::callback("❌ Close Position", format!("menu:close:{sym_lower}")),
+        ],
+    ])
+}
+
+pub fn pending_order_placed_keyboard(_symbol: &str) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback("📋 View Open Orders", "action:orders"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main"),
         ],
     ])
 }
@@ -825,20 +836,23 @@ async fn show_orders_view(
 
     send_typing(bot, chat_id).await;
 
-    match state
+    let orders_future = state
         .trading
-        .get_user_open_orders(&user.account_id, user.indexer_account_id.as_deref())
-        .await
-    {
-        Ok(orders) if orders.is_empty() => {
-            let text = "📋 *Open Limit Orders*\n\nYou currently have no open/unfilled limit orders.";
+        .get_user_open_orders(&user.account_id, user.indexer_account_id.as_deref());
+
+    let res = tokio::time::timeout(Duration::from_secs(5), orders_future).await;
+
+    match res {
+        Ok(Ok(orders)) if orders.is_empty() => {
+            let text = "📋 *Open Limit Orders*\n\nNo open limit orders.";
             let kb = InlineKeyboardMarkup::new(vec![
                 vec![InlineKeyboardButton::callback("📊 Place an Order", "menu:markets")],
+                vec![InlineKeyboardButton::callback("🔄 Refresh", "action:orders")],
                 vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
             ]);
             edit_or_send(bot, chat_id, message_id, text, kb).await?;
         }
-        Ok(orders) => {
+        Ok(Ok(orders)) => {
             let mut text = format!("📋 *Your Open Limit Orders ({})*\n\n", orders.len());
             let mut buttons = Vec::new();
 
@@ -889,9 +903,24 @@ async fn show_orders_view(
             let kb = InlineKeyboardMarkup::new(buttons);
             edit_or_send(bot, chat_id, message_id, &text, kb).await?;
         }
-        Err(e) => {
-            let err_text = format!("❌ *Failed to fetch open orders*\n\n{e}");
-            edit_or_send(bot, chat_id, message_id, &err_text, back_to_main_keyboard()).await?;
+        Ok(Err(e)) => {
+            let err_text = format!(
+                "❌ *Failed to fetch open orders*\n\n{}\n\nPlease try refreshing in a few moments.",
+                e
+            );
+            let kb = InlineKeyboardMarkup::new(vec![
+                vec![InlineKeyboardButton::callback("🔄 Retry", "action:orders")],
+                vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
+            ]);
+            edit_or_send(bot, chat_id, message_id, &err_text, kb).await?;
+        }
+        Err(_) => {
+            let timeout_text = "⚠️ *Request Timed Out*\n\nThe Real.xyz indexer took too long to respond. Please try refreshing in a few moments.";
+            let kb = InlineKeyboardMarkup::new(vec![
+                vec![InlineKeyboardButton::callback("🔄 Retry", "action:orders")],
+                vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
+            ]);
+            edit_or_send(bot, chat_id, message_id, timeout_text, kb).await?;
         }
     }
     Ok(())
@@ -1967,6 +1996,18 @@ async fn execute_conversational_trade(
         None => return show_not_connected_notice(bot, chat_id, None).await,
     };
 
+    if matches!(order_type, crate::bot::state::OrderTypeChoice::Limit) {
+        if limit_price.is_none() || limit_price.unwrap_or(0.0) <= 0.0 {
+            bot.send_message(
+                chat_id,
+                "❌ A valid limit price is required for Limit orders. Please try again.",
+            )
+            .reply_markup(back_to_main_keyboard())
+            .await?;
+            return Ok(());
+        }
+    }
+
     let mark_price = match state.trading.get_market_mark_price(market_id).await {
         Ok(p) if p > 0.0 => p,
         Ok(_) | Err(_) => {
@@ -2002,11 +2043,29 @@ async fn execute_conversational_trade(
         TradeDirection::Short => ("Short", "📉"),
     };
 
-    let price_decimals = crate::trading::get_cached_market_price_decimals(market_id);
-    let price_str = match limit_price {
-        Some(p) => crate::trading::round_price_to_decimals(p, price_decimals).0,
-        None => crate::trading::round_price_to_decimals(mark_price, price_decimals).0,
+    let price_str = match (order_type, limit_price) {
+        (crate::bot::state::OrderTypeChoice::Limit, Some(p)) => {
+            crate::trading::sanitize_order_price_for_market(market_id, &p.to_string()).0
+        }
+        _ => {
+            let price_decimals = crate::trading::get_cached_market_price_decimals(market_id);
+            crate::trading::round_price_to_decimals(mark_price, price_decimals).0
+        }
     };
+
+    info!(
+        user_id = user_id,
+        market = %symbol,
+        market_id = %market_id,
+        direction = %dir_str,
+        order_type = ?order_type,
+        limit_price = ?limit_price,
+        exec_price = exec_price,
+        raw_qty = raw_qty,
+        qty_str = %qty_str,
+        price_str = %price_str,
+        "execute_conversational_trade: placing order"
+    );
 
     // Decrypt key into Zeroizing buffer
     let decrypted = match crate::crypto::decrypt_user_key(&state.config.encryption_key, user_id, &user.encrypted_privkey) {
@@ -2046,47 +2105,77 @@ async fn execute_conversational_trade(
     match res {
         Ok(order) if order.success => {
             let order_id = order.order_id.unwrap_or_else(|| "N/A".into());
-            let fill_summary = if !order.fills.is_empty() {
-                let fill_str = order
-                    .fills
-                    .iter()
-                    .map(|f| format!("• Filled `{}` @ `${}`", f.quantity, f.price))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!("\n\n*Fills:*\n{fill_str}")
+            let is_limit = matches!(order_type, crate::bot::state::OrderTypeChoice::Limit);
+            let is_pending = is_limit && order.fills.is_empty();
+
+            if is_pending {
+                let p = limit_price.unwrap_or(exec_price);
+                let text = format!(
+                    "⏳ *{dir_str} Limit Order Placed (Pending)*\n\n\
+                     • Market: *{symbol}*\n\
+                     • Limit Price: *${}*\n\
+                     • Mark Price: *${}*\n\
+                     • Size: `{qty_str}` {symbol}\n\
+                     • Margin: *${:.2}* ({:.0}x)\n\
+                     • Value: *${}*\n\
+                     • Order ID: `{order_id}`\n\n\
+                     • Status: ⏳ *Resting on Order Book (Pending Fill)*\n\
+                     • Note: Order will fill automatically when {symbol} reaches ${}.",
+                    format_usd(p),
+                    format_usd(mark_price),
+                    usd_amount,
+                    leverage,
+                    format_usd(total_notional),
+                    format_usd(p),
+                );
+
+                bot.send_message(chat_id, text)
+                    .reply_markup(pending_order_placed_keyboard(&symbol))
+                    .parse_mode(ParseMode::Markdown)
+                    .await?;
             } else {
-                String::new()
-            };
+                let fill_summary = if !order.fills.is_empty() {
+                    let fill_str = order
+                        .fills
+                        .iter()
+                        .map(|f| format!("• Filled `{}` @ `${}`", f.quantity, f.price))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("\n\n*Fills:*\n{fill_str}")
+                } else {
+                    String::new()
+                };
 
-            let type_str = match order_type {
-                crate::bot::state::OrderTypeChoice::Market => "Market",
-                crate::bot::state::OrderTypeChoice::Limit => "Limit",
-            };
+                let type_str = match order_type {
+                    crate::bot::state::OrderTypeChoice::Market => "Market",
+                    crate::bot::state::OrderTypeChoice::Limit => "Limit",
+                };
 
-            let price_line = match limit_price {
-                Some(p) => format!("• Limit Price: *${}*\n• Mark Price: *${}*", format_usd(p), format_usd(mark_price)),
-                None => format!("• Price: *Market* (${})", format_usd(mark_price)),
-            };
+                let price_line = match limit_price {
+                    Some(p) => format!("• Limit Price: *${}*\n• Mark Price: *${}*", format_usd(p), format_usd(mark_price)),
+                    None => format!("• Price: *Market* (${})", format_usd(mark_price)),
+                };
 
-            let text = format!(
-                "{emoji} *{dir_str} {type_str} Order Placed!*\n\n\
-                 • Market: *{symbol}*\n\
-                 • Margin: *${:.2}*\n\
-                 • Leverage: *{:.0}x*\n\
-                 • Value: *${}*\n\
-                 • Size: `{qty_str}` {symbol}\n\
-                 {}\n\
-                 • Order ID: `{order_id}`\
-                 {fill_summary}",
-                usd_amount,
-                leverage,
-                format_usd(total_notional),
-                price_line,
-            );
-            bot.send_message(chat_id, text)
-                .reply_markup(order_placed_keyboard(&symbol))
-                .parse_mode(ParseMode::Markdown)
-                .await?;
+                let text = format!(
+                    "{emoji} *{dir_str} {type_str} Order Filled!*\n\n\
+                     • Market: *{symbol}*\n\
+                     • Margin: *${:.2}*\n\
+                     • Leverage: *{:.0}x*\n\
+                     • Value: *${}*\n\
+                     • Size: `{qty_str}` {symbol}\n\
+                     {}\n\
+                     • Order ID: `{order_id}`\
+                     {fill_summary}",
+                    usd_amount,
+                    leverage,
+                    format_usd(total_notional),
+                    price_line,
+                );
+                bot.send_message(chat_id, text)
+                    .reply_markup(order_placed_keyboard(&symbol))
+                    .parse_mode(ParseMode::Markdown)
+                    .await?;
+            }
         }
         Ok(order) => {
             let err = order.error_msg.unwrap_or_else(|| "Engine rejected order".into());
@@ -2359,15 +2448,21 @@ async fn cmd_long(
     };
     drop(decrypted);
 
-    let (text, is_success) = match res {
-        Ok(ref r) => (format_order_result(r), r.success),
-        Err(e) => (format!("❌ Failed to place order: {e}"), false),
+    let (text, is_success, is_pending) = match res {
+        Ok(ref r) => {
+            let is_limit = matches!(parsed, ParsedOrderArgs::Limit { .. });
+            let pending = is_limit && r.fills.is_empty() && r.success;
+            (format_order_result(r), r.success, pending)
+        }
+        Err(e) => (format!("❌ Failed to place order: {e}"), false, false),
     };
     let market_sym = match parsed {
         ParsedOrderArgs::Market { ref market, .. } => BotState::market_name(market),
         ParsedOrderArgs::Limit { ref market, .. } => BotState::market_name(market),
     };
-    let kb = if is_success {
+    let kb = if is_pending {
+        pending_order_placed_keyboard(&market_sym)
+    } else if is_success {
         order_placed_keyboard(&market_sym)
     } else {
         back_to_main_keyboard()
@@ -2435,15 +2530,21 @@ async fn cmd_short(
     };
     drop(decrypted);
 
-    let (text, is_success) = match res {
-        Ok(ref r) => (format_order_result(r), r.success),
-        Err(e) => (format!("❌ Failed to place order: {e}"), false),
+    let (text, is_success, is_pending) = match res {
+        Ok(ref r) => {
+            let is_limit = matches!(parsed, ParsedOrderArgs::Limit { .. });
+            let pending = is_limit && r.fills.is_empty() && r.success;
+            (format_order_result(r), r.success, pending)
+        }
+        Err(e) => (format!("❌ Failed to place order: {e}"), false, false),
     };
     let market_sym = match parsed {
         ParsedOrderArgs::Market { ref market, .. } => BotState::market_name(market),
         ParsedOrderArgs::Limit { ref market, .. } => BotState::market_name(market),
     };
-    let kb = if is_success {
+    let kb = if is_pending {
+        pending_order_placed_keyboard(&market_sym)
+    } else if is_success {
         order_placed_keyboard(&market_sym)
     } else {
         back_to_main_keyboard()
@@ -2728,16 +2829,25 @@ fn parse_order_input(
 
 fn format_order_result(r: &crate::trading::OrderResult) -> String {
     let side_emoji = if r.side.to_lowercase().contains("buy") { "📈" } else { "📉" };
-    let status_emoji = if r.success { "✅" } else { "❌" };
+    let is_limit = r.price != "Market";
+    let is_pending = is_limit && r.fills.is_empty() && r.success;
+
+    let title = if is_pending {
+        format!("⏳ {side_emoji} *{} Limit Order Placed (Pending)*", r.side)
+    } else if r.success {
+        format!("✅ {side_emoji} *{} Order*", r.side)
+    } else {
+        format!("❌ {side_emoji} *{} Order Rejected*", r.side)
+    };
+
     let market_display = BotState::market_name(&r.market);
 
     let mut text = format!(
-        "{status_emoji} {side_emoji} *{} Order*\n\n\
+        "{title}\n\n\
          • Market: *{market_display}*\n\
          • Size: `{}`\n\
          • Price: `${}`\n\
          • Client ID: `{}`",
-        r.side,
         r.quantity,
         r.price,
         r.client_order_id,
@@ -2745,6 +2855,10 @@ fn format_order_result(r: &crate::trading::OrderResult) -> String {
 
     if let Some(ref oid) = r.order_id {
         text.push_str(&format!("\n• Order ID: `{oid}`"));
+    }
+
+    if is_pending {
+        text.push_str("\n\n• Status: ⏳ *Resting on Order Book (Pending Fill)*\n• Note: Order will fill automatically when price reaches target.");
     }
 
     if !r.fills.is_empty() {

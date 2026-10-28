@@ -4,7 +4,7 @@
 //! async methods for every bot command. Handlers in `bot/` call only these
 //! methods and never touch the SDK types directly.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
@@ -15,7 +15,7 @@ use sdk::{
     crypto::{RawSigner, Signer},
     types::{
         CancelOrderRequest, OrdersTerminated, Report, SubmitOrderRequest,
-        TradeExecuted, TransactionReport,
+        TradeExecuted, TransactionReport, common::OrderType,
     },
 };
 
@@ -390,12 +390,22 @@ pub fn round_price_to_decimals(price: f64, decimals: usize) -> (String, f64) {
 }
 
 /// Round and format a string price according to a market's allowed price decimals.
+/// Preserves the user's exact price if it already conforms to allowed decimals.
 pub fn sanitize_order_price_for_market(market: &str, price: &str) -> (String, usize, f64) {
     let decimals = get_cached_market_price_decimals(market);
     let cleaned = price.trim().replace('$', "").replace(',', "");
     if let Ok(val) = cleaned.parse::<f64>() {
-        let (formatted, rounded) = round_price_to_decimals(val, decimals);
-        (formatted, decimals, rounded)
+        let user_decimals = if let Some(pos) = cleaned.find('.') {
+            cleaned[pos + 1..].len()
+        } else {
+            0
+        };
+        if user_decimals <= decimals {
+            (cleaned, decimals, val)
+        } else {
+            let (formatted, rounded) = round_price_to_decimals(val, decimals);
+            (formatted, decimals, rounded)
+        }
     } else {
         (price.to_string(), decimals, 0.0)
     }
@@ -712,10 +722,17 @@ impl TradingClient {
         update_cached_market_names(&initial_markets);
         update_cached_market_decimals(&initial_markets);
 
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(6))
+            .connect_timeout(Duration::from_secs(3))
+            .tcp_keepalive(Some(Duration::from_secs(30)))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
             config: Arc::new(cfg.clone()),
-            http: reqwest::Client::new(),
+            http,
             indexer_account_id: Arc::new(RwLock::new(None)),
             markets_cache: Arc::new(std::sync::RwLock::new(MarketsCache {
                 markets: initial_markets,
@@ -1035,10 +1052,11 @@ impl TradingClient {
 
     /// Lookup Account ID and on-chain trading account object ID by IOTA wallet address.
     pub async fn lookup_account_by_address(&self, address: &str) -> Option<AccountLookup> {
-        let url = format!("{}/api/v1/accounts", self.config.network.indexer_url());
-        if let Ok(resp) = self.http.get(&url).send().await {
+        let url = format!("{}/api/v1/accounts?f[address]={}", self.config.network.indexer_url(), address);
+        if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(4), self.http.get(&url).send()).await {
             if let Ok(val) = resp.json::<serde_json::Value>().await {
-                if let Some(list) = val.get("data").and_then(|d| d.as_array()) {
+                let list_opt = val.get("data").and_then(|d| d.as_array()).or_else(|| val.as_array());
+                if let Some(list) = list_opt {
                     for item in list {
                         if let (Some(addr), Some(oid), Some(id)) = (
                             item.get("address").and_then(|a| a.as_str()),
@@ -1061,10 +1079,15 @@ impl TradingClient {
 
     /// Resolve indexer internal account UUID from any on-chain object ID or Account ID.
     pub async fn resolve_user_indexer_id(&self, account_identifier: &str) -> Option<String> {
-        let url = format!("{}/api/v1/accounts", self.config.network.indexer_url());
-        if let Ok(resp) = self.http.get(&url).send().await {
+        let filtered_url = format!(
+            "{}/api/v1/accounts?f[account_object_id]={}",
+            self.config.network.indexer_url(),
+            account_identifier
+        );
+        if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(3), self.http.get(&filtered_url).send()).await {
             if let Ok(val) = resp.json::<serde_json::Value>().await {
-                if let Some(list) = val.get("data").and_then(|d| d.as_array()) {
+                let list_opt = val.get("data").and_then(|d| d.as_array()).or_else(|| val.as_array());
+                if let Some(list) = list_opt {
                     for item in list {
                         if let (Some(oid), Some(id)) = (
                             item.get("account_object_id").and_then(|o| o.as_str()),
@@ -1080,6 +1103,23 @@ impl TradingClient {
                 }
             }
         }
+
+        let direct_url = format!(
+            "{}/api/v1/accounts/{}",
+            self.config.network.indexer_url(),
+            account_identifier
+        );
+        if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(2), self.http.get(&direct_url).send()).await {
+            if resp.status().is_success() {
+                if let Ok(val) = resp.json::<serde_json::Value>().await {
+                    let acc = val.get("data").unwrap_or(&val);
+                    if let Some(id) = acc.get("id").and_then(|i| i.as_str()) {
+                        return Some(id.to_string());
+                    }
+                }
+            }
+        }
+
         None
     }
 
@@ -1094,31 +1134,10 @@ impl TradingClient {
             }
         }
 
-        let url = format!("{}/api/v1/accounts", self.config.network.indexer_url());
-        match self.http.get(&url).send().await {
-            Ok(resp) => {
-                if let Ok(val) = resp.json::<serde_json::Value>().await {
-                    if let Some(list) = val.get("data").and_then(|d| d.as_array()) {
-                        for item in list {
-                            if let (Some(oid), Some(id)) = (
-                                item.get("account_object_id").and_then(|o| o.as_str()),
-                                item.get("id").and_then(|i| i.as_str()),
-                            ) {
-                                if oid.eq_ignore_ascii_case(&self.config.account_id)
-                                    || id.eq_ignore_ascii_case(&self.config.account_id)
-                                {
-                                    let mut guard = self.indexer_account_id.write().await;
-                                    *guard = Some(id.to_string());
-                                    return Some(id.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("Failed to query indexer accounts: {e}");
-            }
+        if let Some(id) = self.resolve_user_indexer_id(&self.config.account_id).await {
+            let mut guard = self.indexer_account_id.write().await;
+            *guard = Some(id.clone());
+            return Some(id);
         }
 
         None
@@ -1662,40 +1681,54 @@ impl TradingClient {
         self.get_user_open_position(&self.config.account_id, None, market_id).await
     }
 
-    /// Fetch all open/unfilled limit orders from the Real.xyz indexer for a user.
-    pub async fn get_user_open_orders(
-        &self,
-        account_id: &str,
-        indexer_id_opt: Option<&str>,
-    ) -> BotResult<Vec<OpenLimitOrder>> {
-        let indexer_id = match indexer_id_opt {
-            Some(id) if !id.is_empty() => id.to_string(),
-            _ => match self.resolve_user_indexer_id(account_id).await {
-                Some(id) => id,
-                None => account_id.to_string(),
-            },
-        };
-
+    /// Fetch open orders directly for an indexer ID or account ID.
+    async fn fetch_orders_from_indexer(&self, id: &str) -> BotResult<Vec<OpenLimitOrder>> {
         let url = format!(
             "{}/api/v1/accounts/{}/orders",
             self.config.network.indexer_url(),
-            indexer_id
+            id
         );
 
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| BotError::Trading(format!("Failed to fetch open orders: {e}")))?;
+        let send_res = tokio::time::timeout(
+            Duration::from_secs(4),
+            self.http.get(&url).send()
+        ).await;
 
-        let val = resp
-            .json::<serde_json::Value>()
+        let resp = match send_res {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(BotError::Trading(format!("Failed to connect to indexer: {e}"))),
+            Err(_) => return Err(BotError::Trading("Indexer request timed out".to_string())),
+        };
+
+        // If user has no orders or account is not indexed yet, indexer returns 404.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Vec::new());
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            warn!("Indexer orders endpoint returned status {status} for id {id}");
+            return Err(BotError::Trading(format!("Indexer returned status {status}")));
+        }
+
+        let val: serde_json::Value = resp
+            .json()
             .await
-            .map_err(|e| BotError::Trading(format!("Failed to parse orders response: {e}")))?;
+            .unwrap_or(serde_json::Value::Null);
+
+        if val.is_null() {
+            return Ok(Vec::new());
+        }
+
+        let orders_opt = val
+            .get("data")
+            .and_then(|d| d.as_array())
+            .or_else(|| val.as_array())
+            .or_else(|| val.get("orders").and_then(|o| o.as_array()))
+            .or_else(|| val.get("result").and_then(|r| r.as_array()));
 
         let mut list = Vec::new();
-        if let Some(orders) = val.get("data").and_then(|d| d.as_array()) {
+        if let Some(orders) = orders_opt {
             for o in orders {
                 // Check order status: skip terminal states
                 let status = o
@@ -1816,6 +1849,44 @@ impl TradingClient {
 
         list.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         Ok(list)
+    }
+
+    /// Fetch all open/unfilled limit orders from the Real.xyz indexer for a user.
+    pub async fn get_user_open_orders(
+        &self,
+        account_id: &str,
+        indexer_id_opt: Option<&str>,
+    ) -> BotResult<Vec<OpenLimitOrder>> {
+        let indexer_id = match indexer_id_opt {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => match self.resolve_user_indexer_id(account_id).await {
+                Some(id) => id,
+                None => account_id.to_string(),
+            },
+        };
+
+        let res = self.fetch_orders_from_indexer(&indexer_id).await;
+        match res {
+            Ok(list) if !list.is_empty() => Ok(list),
+            Ok(empty_list) => {
+                if !account_id.is_empty() && !account_id.eq_ignore_ascii_case(&indexer_id) {
+                    if let Ok(fallback_list) = self.fetch_orders_from_indexer(account_id).await {
+                        if !fallback_list.is_empty() {
+                            return Ok(fallback_list);
+                        }
+                    }
+                }
+                Ok(empty_list)
+            }
+            Err(e) => {
+                if !account_id.is_empty() && !account_id.eq_ignore_ascii_case(&indexer_id) {
+                    if let Ok(fallback_list) = self.fetch_orders_from_indexer(account_id).await {
+                        return Ok(fallback_list);
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Fetch open orders for default/admin config account.
@@ -2092,6 +2163,26 @@ impl TradingClient {
             .build()
             .map_err(|e| BotError::Trading(format!("Build order: {e}")))?;
 
+        if order.order_type != OrderType::Limit {
+            return Err(BotError::Trading("Order invariant violated: order_type is not Limit".into()));
+        }
+        if order.limit_price.as_deref() != Some(clean_price.as_str()) {
+            return Err(BotError::Trading(format!(
+                "Limit price invariant violated: expected {}, got {:?}",
+                clean_price, order.limit_price
+            )));
+        }
+
+        info!(
+            market = %market,
+            side = "Buy",
+            order_type = ?order.order_type,
+            limit_price = %clean_price,
+            quantity = %clean_qty,
+            client_order_id = %coid,
+            "Placing Limit BUY order to Real.xyz matching engine"
+        );
+
         let req_id = Uuid::new_v4().to_string();
         let client = self.client.lock().await;
         let report = client
@@ -2101,6 +2192,19 @@ impl TradingClient {
         drop(client);
 
         let mut res = self.parse_order_result(report, "Buy", &clean_qty, &clean_price, market, &coid)?;
+
+        info!(
+            market = %market,
+            side = "Buy",
+            order_type = "Limit",
+            limit_price = %clean_price,
+            client_order_id = %coid,
+            order_id = ?res.order_id,
+            success = res.success,
+            fills_count = res.fills.len(),
+            error = ?res.error_msg,
+            "Limit BUY order response received from matching engine"
+        );
 
         if !res.success && res.error_msg.as_deref().map_or(false, is_price_decimal_error) {
             if let Some((retry_price, new_p_dec)) = next_fewer_decimal_price(market, &clean_price, price_decimals) {
@@ -2177,6 +2281,26 @@ impl TradingClient {
             .build()
             .map_err(|e| BotError::Trading(format!("Build order: {e}")))?;
 
+        if order.order_type != OrderType::Limit {
+            return Err(BotError::Trading("Order invariant violated: order_type is not Limit".into()));
+        }
+        if order.limit_price.as_deref() != Some(clean_price.as_str()) {
+            return Err(BotError::Trading(format!(
+                "Limit price invariant violated: expected {}, got {:?}",
+                clean_price, order.limit_price
+            )));
+        }
+
+        info!(
+            market = %market,
+            side = "Sell",
+            order_type = ?order.order_type,
+            limit_price = %clean_price,
+            quantity = %clean_qty,
+            client_order_id = %coid,
+            "Placing Limit SELL order to Real.xyz matching engine"
+        );
+
         let req_id = Uuid::new_v4().to_string();
         let client = self.client.lock().await;
         let report = client
@@ -2186,6 +2310,19 @@ impl TradingClient {
         drop(client);
 
         let mut res = self.parse_order_result(report, "Sell", &clean_qty, &clean_price, market, &coid)?;
+
+        info!(
+            market = %market,
+            side = "Sell",
+            order_type = "Limit",
+            limit_price = %clean_price,
+            client_order_id = %coid,
+            order_id = ?res.order_id,
+            success = res.success,
+            fills_count = res.fills.len(),
+            error = ?res.error_msg,
+            "Limit SELL order response received from matching engine"
+        );
 
         if !res.success && res.error_msg.as_deref().map_or(false, is_price_decimal_error) {
             if let Some((retry_price, new_p_dec)) = next_fewer_decimal_price(market, &clean_price, price_decimals) {
@@ -2432,6 +2569,27 @@ impl TradingClient {
             .build()
             .map_err(|e| BotError::Trading(format!("Build order: {e}")))?;
 
+        if order.order_type != OrderType::Limit {
+            return Err(BotError::Trading("Order invariant violated: order_type is not Limit".into()));
+        }
+        if order.limit_price.as_deref() != Some(clean_price.as_str()) {
+            return Err(BotError::Trading(format!(
+                "Limit price invariant violated: expected {}, got {:?}",
+                clean_price, order.limit_price
+            )));
+        }
+
+        info!(
+            market = %market,
+            side = "Buy",
+            order_type = ?order.order_type,
+            limit_price = %clean_price,
+            quantity = %clean_qty,
+            account_id = %account_id,
+            client_order_id = %coid,
+            "Placing user Limit BUY order to Real.xyz matching engine"
+        );
+
         let req_id = Uuid::new_v4().to_string();
         let client = self.create_user_signing_client(decrypted_key)?;
         let report = client
@@ -2440,6 +2598,19 @@ impl TradingClient {
             .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
 
         let mut res = self.parse_order_result(report, "Buy", &clean_qty, &clean_price, market, &coid)?;
+
+        info!(
+            market = %market,
+            side = "Buy",
+            order_type = "Limit",
+            limit_price = %clean_price,
+            client_order_id = %coid,
+            order_id = ?res.order_id,
+            success = res.success,
+            fills_count = res.fills.len(),
+            error = ?res.error_msg,
+            "User Limit BUY order response received from matching engine"
+        );
 
         if !res.success && res.error_msg.as_deref().map_or(false, is_price_decimal_error) {
             if let Some((retry_price, new_p_dec)) = next_fewer_decimal_price(market, &clean_price, price_decimals) {
@@ -2512,6 +2683,27 @@ impl TradingClient {
             .build()
             .map_err(|e| BotError::Trading(format!("Build order: {e}")))?;
 
+        if order.order_type != OrderType::Limit {
+            return Err(BotError::Trading("Order invariant violated: order_type is not Limit".into()));
+        }
+        if order.limit_price.as_deref() != Some(clean_price.as_str()) {
+            return Err(BotError::Trading(format!(
+                "Limit price invariant violated: expected {}, got {:?}",
+                clean_price, order.limit_price
+            )));
+        }
+
+        info!(
+            market = %market,
+            side = "Sell",
+            order_type = ?order.order_type,
+            limit_price = %clean_price,
+            quantity = %clean_qty,
+            account_id = %account_id,
+            client_order_id = %coid,
+            "Placing user Limit SELL order to Real.xyz matching engine"
+        );
+
         let req_id = Uuid::new_v4().to_string();
         let client = self.create_user_signing_client(decrypted_key)?;
         let report = client
@@ -2520,6 +2712,19 @@ impl TradingClient {
             .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
 
         let mut res = self.parse_order_result(report, "Sell", &clean_qty, &clean_price, market, &coid)?;
+
+        info!(
+            market = %market,
+            side = "Sell",
+            order_type = "Limit",
+            limit_price = %clean_price,
+            client_order_id = %coid,
+            order_id = ?res.order_id,
+            success = res.success,
+            fills_count = res.fills.len(),
+            error = ?res.error_msg,
+            "User Limit SELL order response received from matching engine"
+        );
 
         if !res.success && res.error_msg.as_deref().map_or(false, is_price_decimal_error) {
             if let Some((retry_price, new_p_dec)) = next_fewer_decimal_price(market, &clean_price, price_decimals) {
