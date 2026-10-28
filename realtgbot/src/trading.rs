@@ -474,17 +474,8 @@ pub fn sanitize_order_price_for_market(market: &str, price: &str) -> (String, us
     let decimals = get_cached_market_price_decimals(market);
     let cleaned = price.trim().replace('$', "").replace(',', "");
     if let Ok(val) = cleaned.parse::<f64>() {
-        let user_decimals = if let Some(pos) = cleaned.find('.') {
-            cleaned[pos + 1..].len()
-        } else {
-            0
-        };
-        if user_decimals <= decimals {
-            (cleaned, decimals, val)
-        } else {
-            let (formatted, rounded) = round_price_to_decimals(val, decimals);
-            (formatted, decimals, rounded)
-        }
+        let (formatted, rounded) = round_price_to_decimals(val, decimals);
+        (formatted, decimals, rounded)
     } else {
         (price.to_string(), decimals, 0.0)
     }
@@ -1222,12 +1213,18 @@ impl TradingClient {
         None
     }
 
-    /// Resolve indexer internal account UUID from any on-chain object ID or Account ID.
+    /// Resolve indexer internal account UUID from any on-chain object ID, Account ID, or Address.
     pub async fn resolve_user_indexer_id(&self, account_identifier: &str) -> Option<String> {
+        let trimmed = account_identifier.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        // 1. Try f[account_object_id]
         let filtered_url = format!(
             "{}/api/v1/accounts?f[account_object_id]={}",
             self.config.network.indexer_url(),
-            account_identifier
+            trimmed
         );
         if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(3), self.http.get(&filtered_url).send()).await {
             if let Ok(val) = resp.json::<serde_json::Value>().await {
@@ -1238,8 +1235,8 @@ impl TradingClient {
                             item.get("account_object_id").and_then(|o| o.as_str()),
                             item.get("id").and_then(|i| i.as_str()),
                         ) {
-                            if oid.eq_ignore_ascii_case(account_identifier)
-                                || id.eq_ignore_ascii_case(account_identifier)
+                            if oid.eq_ignore_ascii_case(trimmed)
+                                || id.eq_ignore_ascii_case(trimmed)
                             {
                                 return Some(id.to_string());
                             }
@@ -1249,17 +1246,37 @@ impl TradingClient {
             }
         }
 
+        // 2. Try direct /api/v1/accounts/{id}
         let direct_url = format!(
             "{}/api/v1/accounts/{}",
             self.config.network.indexer_url(),
-            account_identifier
+            trimmed
         );
-        if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(2), self.http.get(&direct_url).send()).await {
+        if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(3), self.http.get(&direct_url).send()).await {
             if resp.status().is_success() {
                 if let Ok(val) = resp.json::<serde_json::Value>().await {
                     let acc = val.get("data").unwrap_or(&val);
                     if let Some(id) = acc.get("id").and_then(|i| i.as_str()) {
                         return Some(id.to_string());
+                    }
+                }
+            }
+        }
+
+        // 3. Try f[address] in case an address was passed as identifier
+        let addr_url = format!(
+            "{}/api/v1/accounts?f[address]={}",
+            self.config.network.indexer_url(),
+            trimmed
+        );
+        if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(3), self.http.get(&addr_url).send()).await {
+            if let Ok(val) = resp.json::<serde_json::Value>().await {
+                let list_opt = val.get("data").and_then(|d| d.as_array()).or_else(|| val.as_array());
+                if let Some(list) = list_opt {
+                    for item in list {
+                        if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+                            return Some(id.to_string());
+                        }
                     }
                 }
             }
@@ -1827,7 +1844,11 @@ impl TradingClient {
     }
 
     /// Fetch open orders directly for an indexer ID or account ID.
-    async fn fetch_orders_from_indexer(&self, id: &str) -> BotResult<Vec<OpenLimitOrder>> {
+    /// Returns:
+    /// - Ok(Some(list)): Authoritative account response from indexer (status 200). List contains active orders (may be empty).
+    /// - Ok(None): Account not found on indexer (status 404).
+    /// - Err(e): Network or timeout error.
+    async fn fetch_orders_from_indexer(&self, id: &str) -> BotResult<Option<Vec<OpenLimitOrder>>> {
         let url = format!(
             "{}/api/v1/accounts/{}/orders",
             self.config.network.indexer_url(),
@@ -1840,7 +1861,7 @@ impl TradingClient {
 
             if resp.status() == reqwest::StatusCode::NOT_FOUND {
                 debug!("Indexer orders endpoint returned 404 for id {id}");
-                return Ok(serde_json::Value::Null);
+                return Ok(None);
             }
 
             if !resp.status().is_success() {
@@ -1854,25 +1875,22 @@ impl TradingClient {
                 .await
                 .unwrap_or(serde_json::Value::Null);
 
-            Ok(val)
+            Ok(Some(val))
         };
 
-        let val: serde_json::Value = match tokio::time::timeout(Duration::from_millis(2000), fut).await {
-            Ok(Ok(v)) => v,
+        let val_opt = match tokio::time::timeout(Duration::from_secs(5), fut).await {
+            Ok(Ok(Some(v))) => v,
+            Ok(Ok(None)) => return Ok(None),
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(BotError::Trading("Indexer request timed out".to_string())),
         };
 
-        if val.is_null() {
-            return Ok(Vec::new());
-        }
-
-        let orders_opt = val
+        let orders_opt = val_opt
             .get("data")
             .and_then(|d| d.as_array())
-            .or_else(|| val.as_array())
-            .or_else(|| val.get("orders").and_then(|o| o.as_array()))
-            .or_else(|| val.get("result").and_then(|r| r.as_array()));
+            .or_else(|| val_opt.as_array())
+            .or_else(|| val_opt.get("orders").and_then(|o| o.as_array()))
+            .or_else(|| val_opt.get("result").and_then(|r| r.as_array()));
 
         let mut list = Vec::new();
         if let Some(orders) = orders_opt {
@@ -2020,11 +2038,11 @@ impl TradingClient {
 
         list.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         info!(id = %id, count = list.len(), "Fetched open limit orders from indexer");
-        Ok(list)
+        Ok(Some(list))
     }
 
     /// Fetch all open/unfilled limit orders from the Real.xyz indexer for a user.
-    /// Checks all candidate identifiers (trading_account_object_id, account_id, indexer_id, resolved UUID).
+    /// Prioritizes indexer_id, account_id, and resolves if needed.
     pub async fn get_user_open_orders(
         &self,
         account_id: &str,
@@ -2033,21 +2051,7 @@ impl TradingClient {
     ) -> BotResult<Vec<OpenLimitOrder>> {
         let mut candidate_ids: Vec<String> = Vec::new();
 
-        // 1. Account ID (indexer ID e.g. 0x25fe...) - this is the primary indexer key
-        let acc = account_id.trim();
-        if !acc.is_empty() && !candidate_ids.iter().any(|c| c.eq_ignore_ascii_case(acc)) {
-            candidate_ids.push(acc.to_string());
-        }
-
-        // 2. Trading account object ID (on-chain object id e.g. 0xdbd7...)
-        if let Some(toid) = trading_account_obj_id_opt {
-            let t = toid.trim();
-            if !t.is_empty() && !candidate_ids.iter().any(|c| c.eq_ignore_ascii_case(t)) {
-                candidate_ids.push(t.to_string());
-            }
-        }
-
-        // 3. Indexer account ID if provided and distinct
+        // 1. Indexer account ID if provided - prioritize this as it directly indexes orders!
         if let Some(iid) = indexer_id_opt {
             let i = iid.trim();
             if !i.is_empty() && !candidate_ids.iter().any(|c| c.eq_ignore_ascii_case(i)) {
@@ -2055,49 +2059,55 @@ impl TradingClient {
             }
         }
 
-        if candidate_ids.is_empty() {
-            return Ok(Vec::new());
+        // 2. Account ID (indexer ID e.g. 0x25fe...)
+        let acc = account_id.trim();
+        if !acc.is_empty() && !candidate_ids.iter().any(|c| c.eq_ignore_ascii_case(acc)) {
+            candidate_ids.push(acc.to_string());
         }
 
-        let mut all_orders: Vec<OpenLimitOrder> = Vec::new();
+        // 3. Trading account object ID (on-chain object id e.g. 0xdbd7...)
+        if let Some(toid) = trading_account_obj_id_opt {
+            let t = toid.trim();
+            if !t.is_empty() && !candidate_ids.iter().any(|c| c.eq_ignore_ascii_case(t)) {
+                candidate_ids.push(t.to_string());
+            }
+        }
 
-        if candidate_ids.len() == 1 {
-            if let Ok(orders) = self.fetch_orders_from_indexer(&candidate_ids[0]).await {
-                all_orders = orders;
-            }
-        } else {
-            let (res1, res2) = tokio::join!(
-                self.fetch_orders_from_indexer(&candidate_ids[0]),
-                self.fetch_orders_from_indexer(&candidate_ids[1])
-            );
-            if let Ok(orders) = res1 {
-                all_orders.extend(orders);
-            }
-            if let Ok(orders) = res2 {
-                for ord in orders {
-                    if !all_orders.iter().any(|existing| existing.order_id_str == ord.order_id_str) {
-                        all_orders.push(ord);
-                    }
+        // 4. Try candidates in order. When indexer returns HTTP 200 (Some), return immediately!
+        for cid in &candidate_ids {
+            match self.fetch_orders_from_indexer(cid).await {
+                Ok(Some(orders)) => {
+                    // Authoritative response from indexer found!
+                    return Ok(orders);
                 }
-            }
-            if candidate_ids.len() > 2 {
-                if let Ok(orders) = self.fetch_orders_from_indexer(&candidate_ids[2]).await {
-                    for ord in orders {
-                        if !all_orders.iter().any(|existing| existing.order_id_str == ord.order_id_str) {
-                            all_orders.push(ord);
-                        }
-                    }
+                Ok(None) => {
+                    // 404: Account not found under this candidate ID, try next
+                }
+                Err(e) => {
+                    warn!(id = %cid, error = %e, "Candidate indexer order fetch failed");
                 }
             }
         }
 
-        all_orders.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        Ok(all_orders)
+        // 5. Fallback: If all candidates returned 404, attempt indexer resolution
+        let to_resolve = trading_account_obj_id_opt.unwrap_or(acc);
+        if !to_resolve.is_empty() {
+            if let Some(resolved) = self.resolve_user_indexer_id(to_resolve).await {
+                if !candidate_ids.iter().any(|c| c.eq_ignore_ascii_case(&resolved)) {
+                    if let Ok(Some(orders)) = self.fetch_orders_from_indexer(&resolved).await {
+                        return Ok(orders);
+                    }
+                }
+            }
+        }
+
+        Ok(Vec::new())
     }
 
     /// Fetch open orders for default/admin config account.
     pub async fn get_open_orders(&self) -> BotResult<Vec<OpenLimitOrder>> {
-        self.get_user_open_orders(&self.config.account_id, None, None).await
+        let eff_acc = self.get_effective_account_id().await;
+        self.get_user_open_orders(&eff_acc, Some(&self.config.account_id), Some(&eff_acc)).await
     }
 
     // ─── Public Order Operations ────────────────────────────────────────────
@@ -2364,6 +2374,7 @@ impl TradingClient {
             .buy()
             .limit_order(&clean_price)
             .quantity(&clean_qty)
+            .post_only(true)
             .good_till_cancel()
             .client_order_id(&coid)
             .build()
@@ -2422,6 +2433,7 @@ impl TradingClient {
                     .buy()
                     .limit_order(&retry_price)
                     .quantity(&clean_qty)
+                    .post_only(true)
                     .good_till_cancel()
                     .client_order_id(&retry_coid)
                     .build()
@@ -2446,6 +2458,7 @@ impl TradingClient {
                     .buy()
                     .limit_order(&clean_price)
                     .quantity(&retry_qty)
+                    .post_only(true)
                     .good_till_cancel()
                     .client_order_id(&retry_coid)
                     .build()
@@ -2482,6 +2495,7 @@ impl TradingClient {
             .sell()
             .limit_order(&clean_price)
             .quantity(&clean_qty)
+            .post_only(true)
             .good_till_cancel()
             .client_order_id(&coid)
             .build()
@@ -2540,6 +2554,7 @@ impl TradingClient {
                     .sell()
                     .limit_order(&retry_price)
                     .quantity(&clean_qty)
+                    .post_only(true)
                     .good_till_cancel()
                     .client_order_id(&retry_coid)
                     .build()
@@ -2564,6 +2579,7 @@ impl TradingClient {
                     .sell()
                     .limit_order(&clean_price)
                     .quantity(&retry_qty)
+                    .post_only(true)
                     .good_till_cancel()
                     .client_order_id(&retry_coid)
                     .build()
@@ -2770,6 +2786,7 @@ impl TradingClient {
             .buy()
             .limit_order(&clean_price)
             .quantity(&clean_qty)
+            .post_only(true)
             .good_till_cancel()
             .client_order_id(&coid)
             .build()
@@ -2828,6 +2845,7 @@ impl TradingClient {
                     .buy()
                     .limit_order(&retry_price)
                     .quantity(&clean_qty)
+                    .post_only(true)
                     .good_till_cancel()
                     .client_order_id(&retry_coid)
                     .build()
@@ -2850,6 +2868,7 @@ impl TradingClient {
                     .buy()
                     .limit_order(&clean_price)
                     .quantity(&retry_qty)
+                    .post_only(true)
                     .good_till_cancel()
                     .client_order_id(&retry_coid)
                     .build()
@@ -2884,6 +2903,7 @@ impl TradingClient {
             .sell()
             .limit_order(&clean_price)
             .quantity(&clean_qty)
+            .post_only(true)
             .good_till_cancel()
             .client_order_id(&coid)
             .build()
@@ -2942,6 +2962,7 @@ impl TradingClient {
                     .sell()
                     .limit_order(&retry_price)
                     .quantity(&clean_qty)
+                    .post_only(true)
                     .good_till_cancel()
                     .client_order_id(&retry_coid)
                     .build()
@@ -2964,6 +2985,7 @@ impl TradingClient {
                     .sell()
                     .limit_order(&clean_price)
                     .quantity(&retry_qty)
+                    .post_only(true)
                     .good_till_cancel()
                     .client_order_id(&retry_coid)
                     .build()

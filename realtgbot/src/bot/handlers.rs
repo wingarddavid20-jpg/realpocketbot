@@ -892,8 +892,20 @@ async fn show_orders_view(
     state: &BotState,
 ) -> ResponseResult<()> {
     let user_opt = state.users.get_user(user_id).await;
-    let user = match user_opt {
-        Some(u) => u,
+    let (account_id, trading_obj_id, indexer_id) = match user_opt {
+        Some(ref u) => (
+            u.account_id.clone(),
+            u.trading_account_object_id.clone(),
+            u.indexer_account_id.clone(),
+        ),
+        None if state.config.admin_user_id == Some(user_id) => {
+            let eff_acc = state.trading.get_effective_account_id().await;
+            (
+                eff_acc.clone(),
+                Some(state.config.account_id.clone()),
+                Some(eff_acc),
+            )
+        }
         None => return show_not_connected_notice(bot, chat_id, message_id).await,
     };
 
@@ -902,12 +914,12 @@ async fn show_orders_view(
     let orders_future = state
         .trading
         .get_user_open_orders(
-            &user.account_id,
-            user.trading_account_object_id.as_deref(),
-            user.indexer_account_id.as_deref(),
+            &account_id,
+            trading_obj_id.as_deref(),
+            indexer_id.as_deref(),
         );
 
-    let res = tokio::time::timeout(Duration::from_millis(3000), orders_future).await;
+    let res = tokio::time::timeout(Duration::from_secs(8), orders_future).await;
 
     match res {
         Ok(Ok(orders)) if orders.is_empty() => {
@@ -946,7 +958,7 @@ async fn show_orders_view(
                     "• *{sym}* | {side_emoji}\n\
                        Size: {size}\n\
                        Limit Price: *${price}*\n\
-                       Order ID: `{id}` | _{time}_\n\n",
+                       Order ID: `{id}` | ({time})\n\n",
                     sym = sym,
                     side_emoji = side_emoji,
                     size = remaining_str,
@@ -1003,10 +1015,10 @@ async fn handle_cancel_order_button(
     rest: &str,
 ) -> ResponseResult<()> {
     let user_opt = state.users.get_user(user_id).await;
-    let user = match user_opt {
-        Some(u) => u,
-        None => return show_not_connected_notice(bot, chat_id, message_id).await,
-    };
+    let is_admin = state.config.admin_user_id == Some(user_id);
+    if user_opt.is_none() && !is_admin {
+        return show_not_connected_notice(bot, chat_id, message_id).await;
+    }
 
     let parts: Vec<&str> = rest.split(':').collect();
     if parts.len() != 2 {
@@ -1032,28 +1044,34 @@ async fn handle_cancel_order_button(
 
     send_typing(bot, chat_id).await;
 
-    let decrypted = match crate::crypto::decrypt_user_key(&state.config.encryption_key, user_id, &user.encrypted_privkey) {
-        Ok(k) => k,
-        Err(e) => {
-            bot.send_message(chat_id, format!("❌ Decryption error: {e}")).await?;
-            return Ok(());
-        }
-    };
-
     let market_sym = BotState::market_name(&market_id);
-    let mut res = state.trading.cancel_user_order_by_id(&user.account_id, &decrypted, &market_id, order_id).await;
-    if res.as_ref().map_or(false, |c| !c.success) {
-        if let Some(ref toid) = user.trading_account_object_id {
-            if !toid.eq_ignore_ascii_case(&user.account_id) {
-                if let Ok(retry_cancel) = state.trading.cancel_user_order_by_id(toid, &decrypted, &market_id, order_id).await {
-                    if retry_cancel.success {
-                        res = Ok(retry_cancel);
+    let res = if let Some(user) = user_opt {
+        let decrypted = match crate::crypto::decrypt_user_key(&state.config.encryption_key, user_id, &user.encrypted_privkey) {
+            Ok(k) => k,
+            Err(e) => {
+                bot.send_message(chat_id, format!("❌ Decryption error: {e}")).await?;
+                return Ok(());
+            }
+        };
+
+        let mut r = state.trading.cancel_user_order_by_id(&user.account_id, &decrypted, &market_id, order_id).await;
+        if r.as_ref().map_or(false, |c| !c.success) {
+            if let Some(ref toid) = user.trading_account_object_id {
+                if !toid.eq_ignore_ascii_case(&user.account_id) {
+                    if let Ok(retry_cancel) = state.trading.cancel_user_order_by_id(toid, &decrypted, &market_id, order_id).await {
+                        if retry_cancel.success {
+                            r = Ok(retry_cancel);
+                        }
                     }
                 }
             }
         }
-    }
-    drop(decrypted);
+        drop(decrypted);
+        r
+    } else {
+        // Admin fallback via default client
+        state.trading.cancel_order_by_id(&market_id, order_id).await
+    };
 
     match res {
         Ok(cancel) if cancel.success => {
@@ -1973,6 +1991,64 @@ async fn handle_trade_step(
                 }
             };
 
+            if let Ok(mark) = state.trading.get_market_mark_price(&pending.market_id).await {
+                if mark > 0.0 {
+                    match pending.direction {
+                        TradeDirection::Long if price >= mark => {
+                            let cancel_kb = InlineKeyboardMarkup::new(vec![vec![
+                                InlineKeyboardButton::callback("❌ Cancel", "action:cancel"),
+                            ]]);
+                            bot.send_message(
+                                chat_id,
+                                format!(
+                                    "⚠️ *Limit Buy Price Warning*\n\n\
+                                     • Market: *{}*\n\
+                                     • Current Mark Price: *${}*\n\
+                                     • Entered Price: *${}*\n\n\
+                                     A Limit Buy must be placed *below* current market price so it rests as a pending order on the book. Entering a price at or above market price will fill immediately as a market taker order.\n\n\
+                                     Please enter a price *below* ${} (e.g. ${}) or tap Cancel:",
+                                    pending.market_symbol,
+                                    format_usd(mark),
+                                    format_usd(price),
+                                    format_usd(mark),
+                                    format_usd(mark * 0.98),
+                                ),
+                            )
+                            .reply_markup(cancel_kb)
+                            .parse_mode(ParseMode::Markdown)
+                            .await?;
+                            return Ok(());
+                        }
+                        TradeDirection::Short if price <= mark => {
+                            let cancel_kb = InlineKeyboardMarkup::new(vec![vec![
+                                InlineKeyboardButton::callback("❌ Cancel", "action:cancel"),
+                            ]]);
+                            bot.send_message(
+                                chat_id,
+                                format!(
+                                    "⚠️ *Limit Sell Price Warning*\n\n\
+                                     • Market: *{}*\n\
+                                     • Current Mark Price: *${}*\n\
+                                     • Entered Price: *${}*\n\n\
+                                     A Limit Sell must be placed *above* current market price so it rests as a pending order on the book. Entering a price at or below market price will fill immediately as a market taker order.\n\n\
+                                     Please enter a price *above* ${} (e.g. ${}) or tap Cancel:",
+                                    pending.market_symbol,
+                                    format_usd(mark),
+                                    format_usd(price),
+                                    format_usd(mark),
+                                    format_usd(mark * 1.02),
+                                ),
+                            )
+                            .reply_markup(cancel_kb)
+                            .parse_mode(ParseMode::Markdown)
+                            .await?;
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             state.clear_session(chat_id).await;
             execute_conversational_trade(
                 bot,
@@ -2112,6 +2188,54 @@ async fn execute_conversational_trade(
             return Ok(());
         }
     };
+
+    if matches!(order_type, crate::bot::state::OrderTypeChoice::Limit) {
+        if let Some(p) = limit_price {
+            match direction {
+                TradeDirection::Long if p >= mark_price => {
+                    bot.send_message(
+                        chat_id,
+                        format!(
+                            "❌ *Invalid Limit Buy Price*\n\n\
+                             • Market: *{symbol}*\n\
+                             • Current Mark Price: *${}*\n\
+                             • Your Limit Price: *${}*\n\n\
+                             A Limit Buy order must be placed *below* market price to rest on the book as a pending order. A price at or above market would fill immediately as a market taker order.\n\n\
+                             Please place your limit buy below ${}.",
+                            format_usd(mark_price),
+                            format_usd(p),
+                            format_usd(mark_price),
+                        ),
+                    )
+                    .reply_markup(back_to_main_keyboard())
+                    .parse_mode(ParseMode::Markdown)
+                    .await?;
+                    return Ok(());
+                }
+                TradeDirection::Short if p <= mark_price => {
+                    bot.send_message(
+                        chat_id,
+                        format!(
+                            "❌ *Invalid Limit Sell Price*\n\n\
+                             • Market: *{symbol}*\n\
+                             • Current Mark Price: *${}*\n\
+                             • Your Limit Price: *${}*\n\n\
+                             A Limit Sell order must be placed *above* market price to rest on the book as a pending order. A price at or below market would fill immediately as a market taker order.\n\n\
+                             Please place your limit sell above ${}.",
+                            format_usd(mark_price),
+                            format_usd(p),
+                            format_usd(mark_price),
+                        ),
+                    )
+                    .reply_markup(back_to_main_keyboard())
+                    .parse_mode(ParseMode::Markdown)
+                    .await?;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+    }
 
     let exec_price = limit_price.unwrap_or(mark_price);
     let total_notional = usd_amount * leverage;
