@@ -838,7 +838,11 @@ async fn show_orders_view(
 
     let orders_future = state
         .trading
-        .get_user_open_orders(&user.account_id, user.indexer_account_id.as_deref());
+        .get_user_open_orders(
+            &user.account_id,
+            user.trading_account_object_id.as_deref(),
+            user.indexer_account_id.as_deref(),
+        );
 
     let res = tokio::time::timeout(Duration::from_secs(5), orders_future).await;
 
@@ -947,11 +951,17 @@ async fn handle_cancel_order_button(
     }
 
     let market_id = parts[0];
-    let order_id: u128 = match parts[1].parse() {
+    let order_id: u128 = match parts[1].parse::<u128>() {
         Ok(id) => id,
         Err(_) => {
-            bot.send_message(chat_id, "❌ Invalid order ID.").await?;
-            return Ok(());
+            let clean = parts[1].trim_start_matches("0x").trim_start_matches("0X");
+            match u128::from_str_radix(clean, 16) {
+                Ok(id) => id,
+                Err(_) => {
+                    bot.send_message(chat_id, "❌ Invalid order ID.").await?;
+                    return Ok(());
+                }
+            }
         }
     };
 
@@ -966,7 +976,18 @@ async fn handle_cancel_order_button(
     };
 
     let market_sym = BotState::market_name(market_id);
-    let res = state.trading.cancel_user_order_by_id(&user.account_id, &decrypted, market_id, order_id).await;
+    let mut res = state.trading.cancel_user_order_by_id(&user.account_id, &decrypted, market_id, order_id).await;
+    if res.as_ref().map_or(false, |c| !c.success) {
+        if let Some(ref toid) = user.trading_account_object_id {
+            if !toid.eq_ignore_ascii_case(&user.account_id) {
+                if let Ok(retry_cancel) = state.trading.cancel_user_order_by_id(toid, &decrypted, market_id, order_id).await {
+                    if retry_cancel.success {
+                        res = Ok(retry_cancel);
+                    }
+                }
+            }
+        }
+    }
     drop(decrypted);
 
     match res {

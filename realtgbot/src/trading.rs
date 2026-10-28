@@ -1702,6 +1702,7 @@ impl TradingClient {
 
         // If user has no orders or account is not indexed yet, indexer returns 404.
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            debug!("Indexer orders endpoint returned 404 for id {id}");
             return Ok(Vec::new());
         }
 
@@ -1735,7 +1736,7 @@ impl TradingClient {
                     .get("status")
                     .or_else(|| o.get("st"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("open");
+                    .unwrap_or("Active");
 
                 if status.eq_ignore_ascii_case("filled")
                     || status.eq_ignore_ascii_case("cancelled")
@@ -1743,26 +1744,40 @@ impl TradingClient {
                     || status.eq_ignore_ascii_case("closed")
                     || status.eq_ignore_ascii_case("expired")
                     || status.eq_ignore_ascii_case("rejected")
+                    || status.eq_ignore_ascii_case("killed")
                 {
                     continue;
                 }
 
-                // Extract order_id as u128
-                let order_id = if let Some(n) = o.get("order_id").or_else(|| o.get("id")).and_then(|v| v.as_u64()) {
-                    n as u128
-                } else if let Some(s) = o.get("order_id").or_else(|| o.get("id")).and_then(|v| v.as_str()) {
-                    s.parse::<u128>().unwrap_or(0)
-                } else {
-                    0
+                // Extract order_id / id from compact or verbose fields
+                let id_raw = o.get("order_id")
+                    .or_else(|| o.get("id"))
+                    .or_else(|| o.get("i"))
+                    .or_else(|| o.get("oid"))
+                    .or_else(|| o.get("client_order_id"))
+                    .or_else(|| o.get("ci"));
+
+                let order_id_str = match id_raw {
+                    Some(v) if v.is_string() => v.as_str().unwrap().to_string(),
+                    Some(v) if v.is_number() => v.to_string(),
+                    _ => String::new(),
                 };
 
-                if order_id == 0 {
+                if order_id_str.is_empty() {
                     continue;
                 }
+
+                let order_id = order_id_str.parse::<u128>().ok()
+                    .or_else(|| {
+                        let clean = order_id_str.trim_start_matches("0x").trim_start_matches("0X");
+                        u128::from_str_radix(clean, 16).ok()
+                    })
+                    .unwrap_or(0);
 
                 let market_id = o
                     .get("market_id")
                     .or_else(|| o.get("m"))
+                    .or_else(|| o.get("market"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
@@ -1771,6 +1786,7 @@ impl TradingClient {
 
                 let side = o
                     .get("side")
+                    .or_else(|| o.get("s"))
                     .or_else(|| o.get("direction"))
                     .or_else(|| o.get("d"))
                     .and_then(|v| v.as_str())
@@ -1780,62 +1796,71 @@ impl TradingClient {
                 let price = o
                     .get("price")
                     .or_else(|| o.get("p"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .or_else(|| o.get("price").or_else(|| o.get("p")).and_then(|v| v.as_f64()))
+                    .and_then(|v| {
+                        if let Some(s) = v.as_str() {
+                            s.parse::<f64>().ok()
+                        } else if let Some(n) = v.as_f64() {
+                            Some(n)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or(0.0);
 
                 let quantity = o
-                    .get("volume")
+                    .get("quantity")
+                    .or_else(|| o.get("q"))
+                    .or_else(|| o.get("volume"))
                     .or_else(|| o.get("size"))
-                    .or_else(|| o.get("quantity"))
-                    .or_else(|| o.get("s"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .or_else(|| {
-                        o.get("volume")
-                            .or_else(|| o.get("size"))
-                            .or_else(|| o.get("quantity"))
-                            .or_else(|| o.get("s"))
-                            .and_then(|v| v.as_f64())
+                    .and_then(|v| {
+                        if let Some(s) = v.as_str() {
+                            s.parse::<f64>().ok()
+                        } else if let Some(n) = v.as_f64() {
+                            Some(n)
+                        } else {
+                            None
+                        }
                     })
                     .unwrap_or(0.0);
 
                 let remaining_quantity = o
-                    .get("remaining_size")
+                    .get("remaining_quantity")
+                    .or_else(|| o.get("rq"))
+                    .or_else(|| o.get("remaining_size"))
                     .or_else(|| o.get("remaining_volume"))
                     .or_else(|| o.get("unfilled_size"))
-                    .or_else(|| o.get("remaining_quantity"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .or_else(|| {
-                        o.get("remaining_size")
-                            .or_else(|| o.get("remaining_volume"))
-                            .or_else(|| o.get("unfilled_size"))
-                            .or_else(|| o.get("remaining_quantity"))
-                            .and_then(|v| v.as_f64())
+                    .and_then(|v| {
+                        if let Some(s) = v.as_str() {
+                            s.parse::<f64>().ok()
+                        } else if let Some(n) = v.as_f64() {
+                            Some(n)
+                        } else {
+                            None
+                        }
                     })
                     .unwrap_or(quantity);
 
-                if remaining_quantity <= 0.0 && status.eq_ignore_ascii_case("partially_filled") {
+                if remaining_quantity <= 0.0 && (status.eq_ignore_ascii_case("partially_filled") || quantity > 0.0) {
                     continue;
                 }
 
                 let timestamp = o
-                    .get("created_at_epoch_ms")
+                    .get("created_at_ms")
+                    .or_else(|| o.get("ca_ms"))
+                    .or_else(|| o.get("created_at_epoch_ms"))
                     .or_else(|| o.get("timestamp_ms"))
-                    .and_then(|v| v.as_i64())
+                    .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|n| n as i64)))
                     .or_else(|| {
                         o.get("created_at")
                             .and_then(|v| v.as_str())
                             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                             .map(|dt| dt.timestamp_millis())
                     })
-                    .unwrap_or(0);
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
                 list.push(OpenLimitOrder {
                     order_id,
-                    order_id_str: order_id.to_string(),
+                    order_id_str,
                     market_id,
                     market_symbol,
                     side,
@@ -1848,50 +1873,91 @@ impl TradingClient {
         }
 
         list.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        info!(id = %id, count = list.len(), "Fetched open limit orders from indexer");
         Ok(list)
     }
 
     /// Fetch all open/unfilled limit orders from the Real.xyz indexer for a user.
+    /// Checks all candidate identifiers (trading_account_object_id, account_id, indexer_id, resolved UUID).
     pub async fn get_user_open_orders(
         &self,
         account_id: &str,
+        trading_account_obj_id_opt: Option<&str>,
         indexer_id_opt: Option<&str>,
     ) -> BotResult<Vec<OpenLimitOrder>> {
-        let indexer_id = match indexer_id_opt {
-            Some(id) if !id.is_empty() => id.to_string(),
-            _ => match self.resolve_user_indexer_id(account_id).await {
-                Some(id) => id,
-                None => account_id.to_string(),
-            },
-        };
+        let mut candidate_ids: Vec<String> = Vec::new();
 
-        let res = self.fetch_orders_from_indexer(&indexer_id).await;
-        match res {
-            Ok(list) if !list.is_empty() => Ok(list),
-            Ok(empty_list) => {
-                if !account_id.is_empty() && !account_id.eq_ignore_ascii_case(&indexer_id) {
-                    if let Ok(fallback_list) = self.fetch_orders_from_indexer(account_id).await {
-                        if !fallback_list.is_empty() {
-                            return Ok(fallback_list);
+        // 1. Trading account object ID (on-chain object id e.g. 0x445c... or 0xdbd7...)
+        if let Some(toid) = trading_account_obj_id_opt {
+            let t = toid.trim();
+            if !t.is_empty() && !candidate_ids.iter().any(|c| c.eq_ignore_ascii_case(t)) {
+                candidate_ids.push(t.to_string());
+            }
+        }
+
+        // 2. Account ID (e.g. 0xa6af... or 0x25fe...)
+        let acc = account_id.trim();
+        if !acc.is_empty() && !candidate_ids.iter().any(|c| c.eq_ignore_ascii_case(acc)) {
+            candidate_ids.push(acc.to_string());
+        }
+
+        // 3. Indexer account ID if provided and distinct
+        if let Some(iid) = indexer_id_opt {
+            let i = iid.trim();
+            if !i.is_empty() && !candidate_ids.iter().any(|c| c.eq_ignore_ascii_case(i)) {
+                candidate_ids.push(i.to_string());
+            }
+        }
+
+        // 4. Resolve indexer internal UUID if not already present
+        if let Some(resolved) = self.resolve_user_indexer_id(account_id).await {
+            let r = resolved.trim();
+            if !r.is_empty() && !candidate_ids.iter().any(|c| c.eq_ignore_ascii_case(r)) {
+                candidate_ids.push(r.to_string());
+            }
+        }
+
+        let mut all_orders: Vec<OpenLimitOrder> = Vec::new();
+        let mut last_err = None;
+
+        for cid in &candidate_ids {
+            match self.fetch_orders_from_indexer(cid).await {
+                Ok(mut orders) if !orders.is_empty() => {
+                    for ord in orders.drain(..) {
+                        if !all_orders.iter().any(|existing| existing.order_id_str == ord.order_id_str) {
+                            all_orders.push(ord);
                         }
                     }
                 }
-                Ok(empty_list)
-            }
-            Err(e) => {
-                if !account_id.is_empty() && !account_id.eq_ignore_ascii_case(&indexer_id) {
-                    if let Ok(fallback_list) = self.fetch_orders_from_indexer(account_id).await {
-                        return Ok(fallback_list);
-                    }
+                Ok(_) => {}
+                Err(e) => {
+                    last_err = Some(e);
                 }
-                Err(e)
             }
         }
+
+        if !all_orders.is_empty() {
+            all_orders.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            return Ok(all_orders);
+        }
+
+        if candidate_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if let Some(e) = last_err {
+            if all_orders.is_empty() {
+                // If candidate returned error, still return empty rather than breaking if any returned 404
+                debug!("All candidate lookups completed without active orders (last err: {e})");
+            }
+        }
+
+        Ok(Vec::new())
     }
 
     /// Fetch open orders for default/admin config account.
     pub async fn get_open_orders(&self) -> BotResult<Vec<OpenLimitOrder>> {
-        self.get_user_open_orders(&self.config.account_id, None).await
+        self.get_user_open_orders(&self.config.account_id, None, None).await
     }
 
     // ─── Public Order Operations ────────────────────────────────────────────
