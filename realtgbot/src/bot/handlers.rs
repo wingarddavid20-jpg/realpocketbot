@@ -185,18 +185,45 @@ pub fn pending_order_placed_keyboard(_symbol: &str) -> InlineKeyboardMarkup {
     ])
 }
 
-pub fn leverage_keyboard() -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new(vec![
-        vec![
-            InlineKeyboardButton::callback("2x", "lev:2"),
-            InlineKeyboardButton::callback("5x", "lev:5"),
-            InlineKeyboardButton::callback("10x", "lev:10"),
-            InlineKeyboardButton::callback("20x", "lev:20"),
-        ],
-        vec![
-            InlineKeyboardButton::callback("❌ Cancel", "action:cancel"),
-        ],
-    ])
+pub fn leverage_keyboard(max_leverage: Option<f64>) -> InlineKeyboardMarkup {
+    let max = max_leverage.unwrap_or(20.0).max(1.0);
+    let mut options = Vec::new();
+    for &opt in &[2.0, 5.0, 10.0, 20.0] {
+        if opt < max {
+            options.push(opt);
+        }
+    }
+    if !options.contains(&max) {
+        options.push(max);
+    }
+
+    let mut rows: Vec<Vec<InlineKeyboardButton>> = Vec::new();
+    if options.len() <= 4 {
+        let row: Vec<InlineKeyboardButton> = options
+            .into_iter()
+            .map(|opt| {
+                InlineKeyboardButton::callback(format!("{opt:.0}x"), format!("lev:{opt:.0}"))
+            })
+            .collect();
+        rows.push(row);
+    } else {
+        let row1: Vec<InlineKeyboardButton> = options[..3]
+            .iter()
+            .map(|opt| {
+                InlineKeyboardButton::callback(format!("{opt:.0}x"), format!("lev:{opt:.0}"))
+            })
+            .collect();
+        let row2: Vec<InlineKeyboardButton> = options[3..]
+            .iter()
+            .map(|opt| {
+                InlineKeyboardButton::callback(format!("{opt:.0}x"), format!("lev:{opt:.0}"))
+            })
+            .collect();
+        rows.push(row1);
+        rows.push(row2);
+    }
+    rows.push(vec![InlineKeyboardButton::callback("❌ Cancel", "action:cancel")]);
+    InlineKeyboardMarkup::new(rows)
 }
 
 pub fn order_type_keyboard() -> InlineKeyboardMarkup {
@@ -1440,6 +1467,7 @@ async fn start_trade_from_button(
             return Ok(());
         }
     };
+    let _ = state.trading.get_market_max_leverage_async(&market_id).await;
     let sym_upper = BotState::market_name(&market_id);
 
     let pending = PendingTrade {
@@ -1530,16 +1558,17 @@ async fn handle_order_size_percentage(
         return Ok(());
     }
 
+    let max_lev = state.trading.get_market_max_leverage_async(&pending.market_id).await;
     pending.step = TradeStep::AwaitingLeverage { usd_amount: usd };
     state.set_session(chat_id, pending).await;
 
     let prompt_text = format!(
         "Selected: *${usd:.2}* ({pct:.0}% of available ${:.2})\n\n\
-         What leverage? (Choose or type e.g. 5x, 10x, 20x):",
+         What leverage? (Up to *{max_lev:.0}x* — choose or type):",
         bal.available_margin
     );
     bot.send_message(chat_id, prompt_text)
-        .reply_markup(leverage_keyboard())
+        .reply_markup(leverage_keyboard(Some(max_lev)))
         .parse_mode(ParseMode::Markdown)
         .await?;
     Ok(())
@@ -1556,11 +1585,13 @@ async fn handle_leverage_selection(
     match session {
         Some(mut pending) => {
             if let TradeStep::AwaitingLeverage { usd_amount } = pending.step {
-                pending.step = TradeStep::AwaitingOrderType { usd_amount, leverage };
+                let max_lev = state.trading.get_market_max_leverage(&pending.market_id);
+                let clamped_leverage = leverage.min(max_lev).max(1.0);
+                pending.step = TradeStep::AwaitingOrderType { usd_amount, leverage: clamped_leverage };
                 state.set_session(chat_id, pending).await;
                 bot.send_message(
                     chat_id,
-                    format!("Leverage set to *{leverage:.0}x*.\n\nChoose order type:"),
+                    format!("Leverage set to *{clamped_leverage:.0}x*.\n\nChoose order type:"),
                 )
                 .reply_markup(order_type_keyboard())
                 .parse_mode(ParseMode::Markdown)
@@ -1880,25 +1911,27 @@ async fn handle_trade_step(
                 }
             };
 
+            let max_lev = state.trading.get_market_max_leverage_async(&pending.market_id).await;
             pending.step = TradeStep::AwaitingLeverage { usd_amount: usd };
             state.set_session(chat_id, pending).await;
 
-            let prompt_text = format!("Selected: *${usd:.2}*\n\nWhat leverage? (Choose or type e.g. 5x, 10x, 20x):");
+            let prompt_text = format!("Selected: *${usd:.2}*\n\nWhat leverage? (Up to *{max_lev:.0}x* — choose or type):");
             bot.send_message(chat_id, prompt_text)
-                .reply_markup(leverage_keyboard())
+                .reply_markup(leverage_keyboard(Some(max_lev)))
                 .parse_mode(ParseMode::Markdown)
                 .await?;
         }
         TradeStep::AwaitingLeverage { usd_amount } => {
+            let max_lev = state.trading.get_market_max_leverage(&pending.market_id);
             let cleaned = text.trim().trim_end_matches(['x', 'X']).trim();
             let lev = match cleaned.parse::<f64>() {
-                Ok(v) if v >= 1.0 && v <= 50.0 => v,
+                Ok(v) if v >= 1.0 && v <= max_lev => v,
                 _ => {
                     bot.send_message(
                         chat_id,
-                        "❌ Please enter a valid leverage between 1x and 50x (e.g. 5x, 10x, 20x) or tap Cancel:",
+                        format!("❌ Please enter a valid leverage between 1x and {max_lev:.0}x (e.g. 5x, 10x, {max_lev:.0}x) or tap Cancel:"),
                     )
-                    .reply_markup(leverage_keyboard())
+                    .reply_markup(leverage_keyboard(Some(max_lev)))
                     .await?;
                     return Ok(());
                 }

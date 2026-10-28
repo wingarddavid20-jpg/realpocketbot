@@ -43,6 +43,26 @@ static CACHED_MARKET_LOT_SIZES: std::sync::RwLock<Option<HashMap<String, f64>>> 
 static CACHED_MARKET_PRICE_DECIMALS: std::sync::RwLock<Option<HashMap<String, usize>>> =
     std::sync::RwLock::new(None);
 
+/// Global map for instantaneous market_id / symbol / base_asset -> max allowed leverage.
+static CACHED_MARKET_MAX_LEVERAGE: std::sync::RwLock<Option<HashMap<String, f64>>> =
+    std::sync::RwLock::new(None);
+
+/// Fallback max leverage per market (e.g. BTC 40x, ETH 25x, SOL 20x, HYPE 20x, default 20x).
+pub fn fallback_max_leverage(identifier: &str) -> f64 {
+    let clean = identifier.trim().to_uppercase();
+    if clean.starts_with("BTC") {
+        40.0
+    } else if clean.starts_with("ETH") {
+        25.0
+    } else if clean.starts_with("SOL") {
+        20.0
+    } else if clean.starts_with("HYPE") {
+        20.0
+    } else {
+        20.0
+    }
+}
+
 /// Fallback precision map matching Real.xyz engine order rules (size_decimal_places):
 /// BTC → 4 decimals (lot size 0.0001), ETH → 3 decimals (lot size 0.001),
 /// SOL → 2 decimals (lot size 0.01), HYPE → 2 decimals (lot size 0.01),
@@ -275,6 +295,65 @@ pub fn get_cached_market_price_decimals(identifier: &str) -> usize {
     fallback_price_decimals(identifier)
 }
 
+pub fn update_cached_market_max_leverage(markets: &[MarketInfo]) {
+    let mut map = HashMap::new();
+    for m in markets {
+        let lev = m.max_leverage;
+        map.insert(m.market_id.to_lowercase(), lev);
+        map.insert(m.base_asset.to_lowercase(), lev);
+        map.insert(m.symbol.to_lowercase(), lev);
+        map.insert(m.short_name.to_lowercase(), lev);
+    }
+    if let Ok(mut guard) = CACHED_MARKET_MAX_LEVERAGE.write() {
+        if let Some(ref mut existing) = *guard {
+            for (k, v) in map {
+                existing.insert(k, v);
+            }
+        } else {
+            *guard = Some(map);
+        }
+    }
+}
+
+pub fn set_cached_market_max_leverage(market_id_or_sym: &str, max_lev: f64) {
+    let key = market_id_or_sym.trim().to_lowercase();
+    if let Ok(mut guard) = CACHED_MARKET_MAX_LEVERAGE.write() {
+        if let Some(ref mut map) = *guard {
+            map.insert(key, max_lev);
+        } else {
+            let mut map = HashMap::new();
+            map.insert(key, max_lev);
+            *guard = Some(map);
+        }
+    }
+}
+
+pub fn get_cached_market_max_leverage(identifier: &str) -> f64 {
+    let key = identifier.trim().to_lowercase();
+    if let Ok(guard) = CACHED_MARKET_MAX_LEVERAGE.read() {
+        if let Some(ref map) = *guard {
+            if let Some(&lev) = map.get(&key) {
+                if lev > 0.0 {
+                    return lev;
+                }
+            }
+        }
+    }
+    if let Some(base_name) = get_cached_market_name(identifier) {
+        if let Ok(guard) = CACHED_MARKET_MAX_LEVERAGE.read() {
+            if let Some(ref map) = *guard {
+                if let Some(&lev) = map.get(&base_name.to_lowercase()) {
+                    if lev > 0.0 {
+                        return lev;
+                    }
+                }
+            }
+        }
+        return fallback_max_leverage(&base_name);
+    }
+    fallback_max_leverage(identifier)
+}
+
 /// Parse quantity precision / lot size from indexer ticker payload, with fallback map.
 pub fn parse_qty_decimals(item: &serde_json::Value, base_asset: &str) -> usize {
     let direct_keys = [
@@ -464,6 +543,8 @@ pub struct MarketInfo {
     pub lot_size: f64,
     #[serde(default = "default_market_price_decimals")]
     pub price_decimals: usize,
+    #[serde(default = "default_market_max_leverage")]
+    pub max_leverage: f64,
 }
 
 fn default_market_qty_decimals() -> usize {
@@ -476,6 +557,10 @@ fn default_market_lot_size() -> f64 {
 
 fn default_market_price_decimals() -> usize {
     1
+}
+
+fn default_market_max_leverage() -> f64 {
+    20.0
 }
 
 #[derive(Debug, Clone)]
@@ -505,6 +590,7 @@ pub fn fallback_markets() -> Vec<MarketInfo> {
             qty_decimals: 4,
             lot_size: 0.0001,
             price_decimals: 1,
+            max_leverage: 40.0,
         },
         MarketInfo {
             market_id: ETH_MARKET.to_string(),
@@ -525,6 +611,7 @@ pub fn fallback_markets() -> Vec<MarketInfo> {
             qty_decimals: 3,
             lot_size: 0.001,
             price_decimals: 2,
+            max_leverage: 25.0,
         },
         MarketInfo {
             market_id: SOL_MARKET.to_string(),
@@ -545,6 +632,7 @@ pub fn fallback_markets() -> Vec<MarketInfo> {
             qty_decimals: 2,
             lot_size: 0.01,
             price_decimals: 3,
+            max_leverage: 20.0,
         },
         MarketInfo {
             market_id: "0x7fa781f5e1d1da7165cf96e5a6898235f55f2d812dd429d3feed69ff776dfa70".into(),
@@ -565,6 +653,7 @@ pub fn fallback_markets() -> Vec<MarketInfo> {
             qty_decimals: 2,
             lot_size: 0.01,
             price_decimals: 3,
+            max_leverage: 20.0,
         },
     ]
 }
@@ -721,6 +810,7 @@ impl TradingClient {
         let initial_markets = fallback_markets();
         update_cached_market_names(&initial_markets);
         update_cached_market_decimals(&initial_markets);
+        update_cached_market_max_leverage(&initial_markets);
 
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(6))
@@ -753,11 +843,27 @@ impl TradingClient {
         set_cached_market_decimals(market_id_or_sym, decimals);
     }
 
+    /// Retrieve maximum allowed leverage for a market synchronously from cache.
+    pub fn get_market_max_leverage(&self, market_id_or_sym: &str) -> f64 {
+        get_cached_market_max_leverage(market_id_or_sym)
+    }
+
+    /// Retrieve maximum allowed leverage for a market asynchronously, refreshing from indexer if needed.
+    pub async fn get_market_max_leverage_async(&self, market_id_or_sym: &str) -> f64 {
+        let cached = get_cached_market_max_leverage(market_id_or_sym);
+        if cached == 20.0 {
+            let _ = self.get_markets().await;
+            get_cached_market_max_leverage(market_id_or_sym)
+        } else {
+            cached
+        }
+    }
+
     /// Fetch dynamic list of active markets from Real.xyz Indexer API.
     pub async fn fetch_markets_from_indexer(&self) -> BotResult<Vec<MarketInfo>> {
         // Fetch live order rules from /api/v1/markets to extract size_decimal_places, lot_size & price_decimal_places
         let markets_url = format!("{}/api/v1/markets", self.config.network.indexer_url());
-        let mut rules_map: HashMap<String, (usize, f64, usize)> = HashMap::new();
+        let mut rules_map: HashMap<String, (usize, f64, usize, f64)> = HashMap::new();
         if let Ok(resp) = self.http.get(&markets_url).send().await {
             if let Ok(val) = resp.json::<serde_json::Value>().await {
                 if let Some(arr) = val.get("data").and_then(|d| d.as_array()) {
@@ -794,15 +900,42 @@ impl TradingClient {
                             })
                             .unwrap_or_else(|| fallback_price_decimals(&base));
 
+                        let max_lev = m.get("risk_engine")
+                            .and_then(|re| re.get("max_leverage"))
+                            .and_then(|v| {
+                                if let Some(s) = v.as_str() {
+                                    s.parse::<f64>().ok()
+                                } else if let Some(n) = v.as_f64() {
+                                    Some(n)
+                                } else {
+                                    None
+                                }
+                            })
+                            .or_else(|| {
+                                m.get("risk_engine")
+                                    .and_then(|re| re.get("imr"))
+                                    .and_then(|v| {
+                                        if let Some(s) = v.as_str() {
+                                            s.parse::<f64>().ok()
+                                        } else if let Some(n) = v.as_f64() {
+                                            Some(n)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .and_then(|imr| if imr > 0.0 { Some((1.0 / imr).round()) } else { None })
+                            })
+                            .unwrap_or_else(|| fallback_max_leverage(&base));
+
                         if let (Some(d), Some(l)) = (dec, lot) {
                             if !id.is_empty() {
-                                rules_map.insert(id, (d, l, price_dec));
+                                rules_map.insert(id, (d, l, price_dec, max_lev));
                             }
                             if !sym.is_empty() {
-                                rules_map.insert(sym.clone(), (d, l, price_dec));
+                                rules_map.insert(sym.clone(), (d, l, price_dec, max_lev));
                             }
                             if !base.is_empty() {
-                                rules_map.insert(base, (d, l, price_dec));
+                                rules_map.insert(base, (d, l, price_dec, max_lev));
                             }
                         }
                     }
@@ -892,13 +1025,18 @@ impl TradingClient {
             let perp_next_funding_time_ms = item.get("perp_next_funding_time_ms")
                 .and_then(|v| v.as_u64());
 
-            let (qty_decimals, lot_size, price_decimals) = if let Some(&(d, l, p)) = rules_map.get(&market_id.to_lowercase())
+            let (qty_decimals, lot_size, price_decimals, max_leverage) = if let Some(&(d, l, p, lev)) = rules_map.get(&market_id.to_lowercase())
                 .or_else(|| rules_map.get(&symbol.to_lowercase()))
                 .or_else(|| rules_map.get(&base_asset.to_lowercase()))
             {
-                (d, l, p)
+                (d, l, p, lev)
             } else {
-                (parse_qty_decimals(item, &base_asset), fallback_market_lot_size(&base_asset), fallback_price_decimals(&base_asset))
+                (
+                    parse_qty_decimals(item, &base_asset),
+                    fallback_market_lot_size(&base_asset),
+                    fallback_price_decimals(&base_asset),
+                    fallback_max_leverage(&base_asset),
+                )
             };
 
             markets.push(MarketInfo {
@@ -920,6 +1058,7 @@ impl TradingClient {
                 qty_decimals,
                 lot_size,
                 price_decimals,
+                max_leverage,
             });
         }
 
@@ -962,6 +1101,7 @@ impl TradingClient {
                 update_cached_market_decimals(&fresh_markets);
                 update_cached_market_lot_sizes(&fresh_markets);
                 update_cached_market_price_decimals(&fresh_markets);
+                update_cached_market_max_leverage(&fresh_markets);
                 if let Ok(mut guard) = self.markets_cache.write() {
                     guard.markets = fresh_markets.clone();
                     guard.last_updated_secs = now;
