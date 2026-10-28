@@ -619,6 +619,20 @@ pub struct TradeHistoryRecord {
     pub timestamp: i64,
 }
 
+/// An open/unfilled limit order from the Real.xyz indexer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenLimitOrder {
+    pub order_id: u128,
+    pub order_id_str: String,
+    pub market_id: String,
+    pub market_symbol: String,
+    pub side: String,
+    pub price: f64,
+    pub quantity: f64,
+    pub remaining_quantity: f64,
+    pub timestamp: i64,
+}
+
 /// Real-time market statistics including funding rate.
 #[derive(Debug, Clone, Default)]
 pub struct MarketStats {
@@ -1646,6 +1660,167 @@ impl TradingClient {
     /// Fetch open position for a given market from the indexer.
     pub async fn get_open_position(&self, market_id: &str) -> BotResult<Option<OpenPosition>> {
         self.get_user_open_position(&self.config.account_id, None, market_id).await
+    }
+
+    /// Fetch all open/unfilled limit orders from the Real.xyz indexer for a user.
+    pub async fn get_user_open_orders(
+        &self,
+        account_id: &str,
+        indexer_id_opt: Option<&str>,
+    ) -> BotResult<Vec<OpenLimitOrder>> {
+        let indexer_id = match indexer_id_opt {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => match self.resolve_user_indexer_id(account_id).await {
+                Some(id) => id,
+                None => account_id.to_string(),
+            },
+        };
+
+        let url = format!(
+            "{}/api/v1/accounts/{}/orders",
+            self.config.network.indexer_url(),
+            indexer_id
+        );
+
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| BotError::Trading(format!("Failed to fetch open orders: {e}")))?;
+
+        let val = resp
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| BotError::Trading(format!("Failed to parse orders response: {e}")))?;
+
+        let mut list = Vec::new();
+        if let Some(orders) = val.get("data").and_then(|d| d.as_array()) {
+            for o in orders {
+                // Check order status: skip terminal states
+                let status = o
+                    .get("status")
+                    .or_else(|| o.get("st"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("open");
+
+                if status.eq_ignore_ascii_case("filled")
+                    || status.eq_ignore_ascii_case("cancelled")
+                    || status.eq_ignore_ascii_case("canceled")
+                    || status.eq_ignore_ascii_case("closed")
+                    || status.eq_ignore_ascii_case("expired")
+                    || status.eq_ignore_ascii_case("rejected")
+                {
+                    continue;
+                }
+
+                // Extract order_id as u128
+                let order_id = if let Some(n) = o.get("order_id").or_else(|| o.get("id")).and_then(|v| v.as_u64()) {
+                    n as u128
+                } else if let Some(s) = o.get("order_id").or_else(|| o.get("id")).and_then(|v| v.as_str()) {
+                    s.parse::<u128>().unwrap_or(0)
+                } else {
+                    0
+                };
+
+                if order_id == 0 {
+                    continue;
+                }
+
+                let market_id = o
+                    .get("market_id")
+                    .or_else(|| o.get("m"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let market_symbol = self.get_market_name(&market_id);
+
+                let side = o
+                    .get("side")
+                    .or_else(|| o.get("direction"))
+                    .or_else(|| o.get("d"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Buy")
+                    .to_string();
+
+                let price = o
+                    .get("price")
+                    .or_else(|| o.get("p"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .or_else(|| o.get("price").or_else(|| o.get("p")).and_then(|v| v.as_f64()))
+                    .unwrap_or(0.0);
+
+                let quantity = o
+                    .get("volume")
+                    .or_else(|| o.get("size"))
+                    .or_else(|| o.get("quantity"))
+                    .or_else(|| o.get("s"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .or_else(|| {
+                        o.get("volume")
+                            .or_else(|| o.get("size"))
+                            .or_else(|| o.get("quantity"))
+                            .or_else(|| o.get("s"))
+                            .and_then(|v| v.as_f64())
+                    })
+                    .unwrap_or(0.0);
+
+                let remaining_quantity = o
+                    .get("remaining_size")
+                    .or_else(|| o.get("remaining_volume"))
+                    .or_else(|| o.get("unfilled_size"))
+                    .or_else(|| o.get("remaining_quantity"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .or_else(|| {
+                        o.get("remaining_size")
+                            .or_else(|| o.get("remaining_volume"))
+                            .or_else(|| o.get("unfilled_size"))
+                            .or_else(|| o.get("remaining_quantity"))
+                            .and_then(|v| v.as_f64())
+                    })
+                    .unwrap_or(quantity);
+
+                if remaining_quantity <= 0.0 && status.eq_ignore_ascii_case("partially_filled") {
+                    continue;
+                }
+
+                let timestamp = o
+                    .get("created_at_epoch_ms")
+                    .or_else(|| o.get("timestamp_ms"))
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| {
+                        o.get("created_at")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                            .map(|dt| dt.timestamp_millis())
+                    })
+                    .unwrap_or(0);
+
+                list.push(OpenLimitOrder {
+                    order_id,
+                    order_id_str: order_id.to_string(),
+                    market_id,
+                    market_symbol,
+                    side,
+                    price,
+                    quantity,
+                    remaining_quantity,
+                    timestamp,
+                });
+            }
+        }
+
+        list.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(list)
+    }
+
+    /// Fetch open orders for default/admin config account.
+    pub async fn get_open_orders(&self) -> BotResult<Vec<OpenLimitOrder>> {
+        self.get_user_open_orders(&self.config.account_id, None).await
     }
 
     // ─── Public Order Operations ────────────────────────────────────────────

@@ -23,17 +23,18 @@ pub fn main_menu_keyboard(is_connected: bool) -> InlineKeyboardMarkup {
         InlineKeyboardMarkup::new(vec![
             vec![
                 InlineKeyboardButton::callback("📍 Positions", "action:positions"),
+                InlineKeyboardButton::callback("📋 Orders", "action:orders"),
+            ],
+            vec![
                 InlineKeyboardButton::callback("📊 Markets", "menu:markets"),
-            ],
-            vec![
                 InlineKeyboardButton::callback("💰 Balance", "action:balance"),
+            ],
+            vec![
                 InlineKeyboardButton::callback("📈 Volume", "action:volume"),
-            ],
-            vec![
                 InlineKeyboardButton::callback("🔔 Alerts", "menu:alerts"),
-                InlineKeyboardButton::callback("📜 History", "action:history"),
             ],
             vec![
+                InlineKeyboardButton::callback("📜 History", "action:history"),
                 InlineKeyboardButton::callback("🔌 Disconnect Wallet", "action:disconnect"),
             ],
         ])
@@ -117,9 +118,10 @@ pub fn market_actions_keyboard(symbol: &str) -> InlineKeyboardMarkup {
         ],
         vec![
             InlineKeyboardButton::callback(format!("❌ Close {symbol}"), format!("menu:close:{sym_lower}")),
-            InlineKeyboardButton::callback(format!("🔔 Alert {symbol}"), format!("alert:market:{sym_lower}")),
+            InlineKeyboardButton::callback("📋 Orders", "action:orders"),
         ],
         vec![
+            InlineKeyboardButton::callback(format!("🔔 Alert {symbol}"), format!("alert:market:{sym_lower}")),
             InlineKeyboardButton::callback("⬅️ Back", "menu:markets"),
         ],
     ])
@@ -304,6 +306,7 @@ pub async fn handle_command(
         Command::Short(args) => Box::pin(cmd_short(&bot, chat_id, user_id, &state, &args)).await,
         Command::Close(args) => Box::pin(cmd_close(&bot, chat_id, user_id, &state, &args)).await,
         Command::Positions => Box::pin(cmd_positions(&bot, chat_id, user_id, &state)).await,
+        Command::Orders => Box::pin(cmd_orders(&bot, chat_id, user_id, &state)).await,
         Command::Alert(args) => Box::pin(cmd_alert(&bot, chat_id, user_id, &state, &args)).await,
         Command::History => Box::pin(cmd_history(&bot, chat_id, user_id, &state)).await,
         Command::Admin => Box::pin(cmd_admin(&bot, chat_id, user_id, &state)).await,
@@ -439,6 +442,10 @@ pub async fn handle_callback(
         Box::pin(handle_order_type_choice(&bot, chat_id, user_id, &state, choice_str)).await?;
     } else if data == "action:positions" {
         Box::pin(show_positions_view(&bot, chat_id, Some(message_id), user_id, &state)).await?;
+    } else if data == "action:orders" {
+        Box::pin(show_orders_view(&bot, chat_id, Some(message_id), user_id, &state)).await?;
+    } else if let Some(rest) = data.strip_prefix("cancel_order:") {
+        Box::pin(handle_cancel_order_button(&bot, chat_id, Some(message_id), user_id, &state, rest)).await?;
     } else if data == "action:history" {
         Box::pin(show_history_view(&bot, chat_id, Some(message_id), user_id, &state)).await?;
     } else if data == "menu:alerts" {
@@ -800,6 +807,171 @@ async fn show_positions_view(
             edit_or_send(bot, chat_id, message_id, &err_text, back_to_main_keyboard()).await?;
         }
     }
+    Ok(())
+}
+
+async fn show_orders_view(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: Option<MessageId>,
+    user_id: u64,
+    state: &BotState,
+) -> ResponseResult<()> {
+    let user_opt = state.users.get_user(user_id).await;
+    let user = match user_opt {
+        Some(u) => u,
+        None => return show_not_connected_notice(bot, chat_id, message_id).await,
+    };
+
+    send_typing(bot, chat_id).await;
+
+    match state
+        .trading
+        .get_user_open_orders(&user.account_id, user.indexer_account_id.as_deref())
+        .await
+    {
+        Ok(orders) if orders.is_empty() => {
+            let text = "📋 *Open Limit Orders*\n\nYou currently have no open/unfilled limit orders.";
+            let kb = InlineKeyboardMarkup::new(vec![
+                vec![InlineKeyboardButton::callback("📊 Place an Order", "menu:markets")],
+                vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
+            ]);
+            edit_or_send(bot, chat_id, message_id, text, kb).await?;
+        }
+        Ok(orders) => {
+            let mut text = format!("📋 *Your Open Limit Orders ({})*\n\n", orders.len());
+            let mut buttons = Vec::new();
+
+            for ord in &orders {
+                let sym = &ord.market_symbol;
+                let is_buy = ord.side.eq_ignore_ascii_case("buy") || ord.side.eq_ignore_ascii_case("long");
+                let side_emoji = if is_buy { "🟢 BUY" } else { "🔴 SELL" };
+
+                let time_str = if ord.timestamp > 0 {
+                    chrono::DateTime::from_timestamp_millis(ord.timestamp)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "Recent".into())
+                } else {
+                    "Recent".into()
+                };
+
+                let remaining_str = if ord.remaining_quantity < ord.quantity && ord.remaining_quantity > 0.0 {
+                    format!("`{}` / `{}` {}", ord.remaining_quantity, ord.quantity, sym)
+                } else {
+                    format!("`{}` {}", ord.quantity, sym)
+                };
+
+                text.push_str(&format!(
+                    "• *{sym}* | {side_emoji}\n\
+                       Size: {size}\n\
+                       Limit Price: *${price}*\n\
+                       Order ID: `{id}` | _{time}_\n\n",
+                    sym = sym,
+                    side_emoji = side_emoji,
+                    size = remaining_str,
+                    price = format_usd(ord.price),
+                    id = ord.order_id_str,
+                    time = time_str,
+                ));
+
+                buttons.push(vec![
+                    InlineKeyboardButton::callback(
+                        format!("❌ Cancel {side_emoji} {sym} @ ${}", format_usd(ord.price)),
+                        format!("cancel_order:{}:{}", ord.market_id, ord.order_id_str),
+                    )
+                ]);
+            }
+
+            buttons.push(vec![
+                InlineKeyboardButton::callback("🔄 Refresh", "action:orders"),
+                InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main"),
+            ]);
+            let kb = InlineKeyboardMarkup::new(buttons);
+            edit_or_send(bot, chat_id, message_id, &text, kb).await?;
+        }
+        Err(e) => {
+            let err_text = format!("❌ *Failed to fetch open orders*\n\n{e}");
+            edit_or_send(bot, chat_id, message_id, &err_text, back_to_main_keyboard()).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_cancel_order_button(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: Option<MessageId>,
+    user_id: u64,
+    state: &BotState,
+    rest: &str,
+) -> ResponseResult<()> {
+    let user_opt = state.users.get_user(user_id).await;
+    let user = match user_opt {
+        Some(u) => u,
+        None => return show_not_connected_notice(bot, chat_id, message_id).await,
+    };
+
+    let parts: Vec<&str> = rest.split(':').collect();
+    if parts.len() != 2 {
+        bot.send_message(chat_id, "❌ Invalid cancel request.").await?;
+        return Ok(());
+    }
+
+    let market_id = parts[0];
+    let order_id: u128 = match parts[1].parse() {
+        Ok(id) => id,
+        Err(_) => {
+            bot.send_message(chat_id, "❌ Invalid order ID.").await?;
+            return Ok(());
+        }
+    };
+
+    send_typing(bot, chat_id).await;
+
+    let decrypted = match crate::crypto::decrypt_user_key(&state.config.encryption_key, user_id, &user.encrypted_privkey) {
+        Ok(k) => k,
+        Err(e) => {
+            bot.send_message(chat_id, format!("❌ Decryption error: {e}")).await?;
+            return Ok(());
+        }
+    };
+
+    let market_sym = BotState::market_name(market_id);
+    let res = state.trading.cancel_user_order_by_id(&user.account_id, &decrypted, market_id, order_id).await;
+    drop(decrypted);
+
+    match res {
+        Ok(cancel) if cancel.success => {
+            let text = format!(
+                "✅ *Order Cancelled Successfully!*\n\n\
+                 • Market: *{market_sym}*\n\
+                 • Order ID: `{order_id}`\n\
+                 • Status: Cancelled on Real.xyz engine"
+            );
+            let kb = InlineKeyboardMarkup::new(vec![
+                vec![InlineKeyboardButton::callback("📋 View Open Orders", "action:orders")],
+                vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
+            ]);
+            edit_or_send(bot, chat_id, message_id, &text, kb).await?;
+        }
+        Ok(_) => {
+            let text = format!(
+                "⚠️ *Order Cancellation Notice*\n\n\
+                 Order `{order_id}` in *{market_sym}* was not cancelled by the engine. \
+                 It may have already been filled or cancelled."
+            );
+            let kb = InlineKeyboardMarkup::new(vec![
+                vec![InlineKeyboardButton::callback("📋 View Open Orders", "action:orders")],
+                vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
+            ]);
+            edit_or_send(bot, chat_id, message_id, &text, kb).await?;
+        }
+        Err(e) => {
+            let text = format!("❌ *Failed to cancel order*\n\n{e}");
+            edit_or_send(bot, chat_id, message_id, &text, back_to_main_keyboard()).await?;
+        }
+    }
+
     Ok(())
 }
 
@@ -1960,6 +2132,7 @@ async fn cmd_help(bot: &Bot, chat_id: ChatId, user_id: u64, state: &BotState) ->
          *Available Commands:*\n\
          • `/start` — Open interactive trading menu\n\
          • `/positions` — View open positions & live PnL\n\
+         • `/orders` — View and cancel open limit orders\n\
          • `/connect` — Connect wallet (`iotaprivkey1...`)\n\
          • `/disconnect` — Disconnect wallet & purge keys\n\
          • `/balance` — View total equity and available margin\n\
@@ -1983,6 +2156,10 @@ async fn cmd_help(bot: &Bot, chat_id: ChatId, user_id: u64, state: &BotState) ->
 
 async fn cmd_positions(bot: &Bot, chat_id: ChatId, user_id: u64, state: &BotState) -> ResponseResult<()> {
     show_positions_view(bot, chat_id, None, user_id, state).await
+}
+
+async fn cmd_orders(bot: &Bot, chat_id: ChatId, user_id: u64, state: &BotState) -> ResponseResult<()> {
+    show_orders_view(bot, chat_id, None, user_id, state).await
 }
 
 async fn cmd_history(bot: &Bot, chat_id: ChatId, user_id: u64, state: &BotState) -> ResponseResult<()> {

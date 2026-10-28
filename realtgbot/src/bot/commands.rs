@@ -43,6 +43,9 @@ pub enum Command {
     #[command(description = "Show open positions with live PnL")]
     Positions,
 
+    #[command(description = "Show and manage open limit orders — /orders")]
+    Orders,
+
     #[command(description = "Set or view price alerts — /alert <market> <price>")]
     Alert(String),
 
