@@ -134,7 +134,40 @@ pub fn close_options_keyboard(symbol: &str) -> InlineKeyboardMarkup {
             InlineKeyboardButton::callback("100%", format!("close:{sym_lower}:100")),
         ],
         vec![
-            InlineKeyboardButton::callback("⬅️ Back", format!("market:{sym_lower}")),
+            InlineKeyboardButton::callback("✏️ Custom", format!("close_custom:{sym_lower}")),
+        ],
+        vec![
+            InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main"),
+        ],
+    ])
+}
+
+pub fn order_size_keyboard(back_callback: Option<&str>) -> InlineKeyboardMarkup {
+    let mut rows = vec![
+        vec![
+            InlineKeyboardButton::callback("25%", "size_pct:25"),
+            InlineKeyboardButton::callback("50%", "size_pct:50"),
+            InlineKeyboardButton::callback("100%", "size_pct:100"),
+        ],
+    ];
+    let mut nav_row = vec![
+        InlineKeyboardButton::callback("❌ Cancel", "action:cancel"),
+    ];
+    if let Some(back) = back_callback {
+        nav_row.push(InlineKeyboardButton::callback("⬅️ Back", back.to_string()));
+    }
+    rows.push(nav_row);
+    InlineKeyboardMarkup::new(rows)
+}
+
+pub fn order_placed_keyboard(symbol: &str) -> InlineKeyboardMarkup {
+    let sym_lower = symbol.to_lowercase();
+    InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("❌ Close Position", format!("menu:close:{sym_lower}")),
         ],
     ])
 }
@@ -388,6 +421,16 @@ pub async fn handle_callback(
             let pct: f64 = parts[1].parse().unwrap_or(100.0);
             Box::pin(execute_button_close(&bot, chat_id, Some(message_id), user_id, &state, symbol, pct)).await?;
         }
+    } else if let Some(sym) = data.strip_prefix("close_custom:") {
+        if state.users.get_user(user_id).await.is_none() {
+            Box::pin(show_not_connected_notice(&bot, chat_id, Some(message_id))).await?;
+        } else {
+            Box::pin(prompt_custom_close_percentage(&bot, chat_id, Some(message_id), sym, &state)).await?;
+        }
+    } else if let Some(pct_str) = data.strip_prefix("size_pct:") {
+        if let Ok(pct) = pct_str.parse::<f64>() {
+            Box::pin(handle_order_size_percentage(&bot, chat_id, user_id, &state, pct)).await?;
+        }
     } else if let Some(lev_str) = data.strip_prefix("lev:") {
         if let Ok(lev) = lev_str.parse::<f64>() {
             Box::pin(handle_leverage_selection(&bot, chat_id, user_id, &state, lev)).await?;
@@ -560,6 +603,41 @@ async fn show_close_options_menu(
         close_options_keyboard(&sym_upper),
     )
     .await
+}
+
+async fn prompt_custom_close_percentage(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: Option<MessageId>,
+    symbol: &str,
+    state: &BotState,
+) -> ResponseResult<()> {
+    let market_id = state.resolve_market(symbol).unwrap_or_else(|| symbol.to_string());
+    let sym_upper = BotState::market_name(&market_id);
+
+    let pending = PendingTrade {
+        direction: TradeDirection::Long,
+        market_id: market_id.clone(),
+        market_symbol: sym_upper.clone(),
+        step: TradeStep::AwaitingClosePercentage {
+            market_id,
+            symbol: sym_upper.clone(),
+        },
+    };
+    state.set_session(chat_id, pending).await;
+
+    let cancel_kb = InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("❌ Cancel", "action:cancel"),
+        InlineKeyboardButton::callback("⬅️ Back", format!("menu:close:{}", symbol.to_lowercase())),
+    ]]);
+
+    let text = format!(
+        "✏️ *Close {sym_upper} Position — Custom Percentage*\n\n\
+         How much of your position do you want to close?\n\
+         Reply with a percentage (e.g. `10%`, `75%`, `33.3%`):"
+    );
+
+    edit_or_send(bot, chat_id, message_id, &text, cancel_kb).await
 }
 
 async fn show_not_connected_notice(
@@ -1117,19 +1195,93 @@ async fn start_trade_from_button(
         TradeDirection::Short => ("Short", "📉"),
     };
 
-    let cancel_kb = InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback("❌ Cancel", "action:cancel"),
-        InlineKeyboardButton::callback("⬅️ Back", format!("market:{}", symbol.to_lowercase())),
-    ]]);
+    let user_opt = state.users.get_user(user_id).await;
+    let bal_info = match user_opt {
+        Some(ref u) => state.trading.get_user_balance(&u.account_id, u.indexer_account_id.as_deref()).await.ok(),
+        None => None,
+    };
+    let bal_line = match bal_info {
+        Some(ref b) => format!("\n• Available Margin: *${:.2}*", b.available_margin),
+        None => String::new(),
+    };
 
     let text = format!(
-        "{emoji} *{dir_name} {sym_upper}*\n\n\
-         How much in USD do you want to use?\n\
-         Reply with an amount (e.g. 50, 100, 500):"
+        "{emoji} *{dir_name} {sym_upper}*\
+         {bal_line}\n\n\
+         How much do you want to use?\n\
+         • Type an amount in USD (e.g. `50` = $50)\n\
+         • Or type a percentage of balance (e.g. `50%`)\n\
+         • Or tap a quick percentage below:"
     );
 
-    edit_or_send(bot, chat_id, message_id, &text, cancel_kb).await?;
+    let kb = order_size_keyboard(Some(&format!("market:{}", symbol.to_lowercase())));
+    edit_or_send(bot, chat_id, message_id, &text, kb).await?;
 
+    Ok(())
+}
+
+async fn handle_order_size_percentage(
+    bot: &Bot,
+    chat_id: ChatId,
+    user_id: u64,
+    state: &BotState,
+    pct: f64,
+) -> ResponseResult<()> {
+    let session = state.get_session(chat_id).await;
+    let mut pending = match session {
+        Some(p) if matches!(p.step, TradeStep::AwaitingUsdAmount) => p,
+        _ => return Ok(()),
+    };
+
+    let user = match state.users.get_user(user_id).await {
+        Some(u) => u,
+        None => {
+            show_not_connected_notice(bot, chat_id, None).await?;
+            return Ok(());
+        }
+    };
+
+    let bal = match state.trading.get_user_balance(&user.account_id, user.indexer_account_id.as_deref()).await {
+        Ok(b) => b,
+        Err(e) => {
+            bot.send_message(chat_id, format!("❌ Failed to fetch available balance: {e}")).await?;
+            return Ok(());
+        }
+    };
+
+    if bal.available_margin <= 0.0 {
+        bot.send_message(
+            chat_id,
+            "❌ Available margin is $0.00. Please deposit funds or enter a custom USD amount (e.g. 50):",
+        )
+        .reply_markup(order_size_keyboard(None))
+        .await?;
+        return Ok(());
+    }
+
+    let usd = ((bal.available_margin * (pct / 100.0) * 100.0).floor()) / 100.0;
+    if usd <= 0.0 {
+        bot.send_message(
+            chat_id,
+            format!("❌ Calculated size from {pct:.0}% is too small (available: ${:.2}). Please enter a USD amount:", bal.available_margin),
+        )
+        .reply_markup(order_size_keyboard(None))
+        .await?;
+        return Ok(());
+    }
+
+    pending.step = TradeStep::AwaitingLeverage { usd_amount: usd };
+    state.set_session(chat_id, pending).await;
+
+    let prompt_text = format!(
+        "Selected: *${usd:.2}* ({pct:.0}% of available ${:.2})\n\n\
+         What leverage? (Choose or type e.g. 5x, 10x, 20x):",
+        bal.available_margin
+    );
+    bot.send_message(chat_id, prompt_text)
+        .reply_markup(leverage_keyboard())
+        .parse_mode(ParseMode::Markdown)
+        .await?;
     Ok(())
 }
 
@@ -1372,32 +1524,99 @@ async fn handle_trade_step(
                 TradeDirection::Long => ("Long", "📈"),
                 TradeDirection::Short => ("Short", "📉"),
             };
-            let cancel_kb = InlineKeyboardMarkup::new(vec![vec![
-                InlineKeyboardButton::callback("❌ Cancel", "action:cancel"),
-            ]]);
-            bot.send_message(
-                chat_id,
-                format!("{emoji} *{dir_name} {symbol}*\n\nHow much in USD do you want to use?\n*(e.g. 50, 100, 500)*"),
-            )
-            .reply_markup(cancel_kb)
-            .parse_mode(ParseMode::Markdown)
-            .await?;
+
+            let user_opt = state.users.get_user(user_id).await;
+            let bal_info = match user_opt {
+                Some(ref u) => state.trading.get_user_balance(&u.account_id, u.indexer_account_id.as_deref()).await.ok(),
+                None => None,
+            };
+            let bal_line = match bal_info {
+                Some(ref b) => format!("\n• Available Margin: *${:.2}*", b.available_margin),
+                None => String::new(),
+            };
+
+            let text = format!(
+                "{emoji} *{dir_name} {symbol}*\
+                 {bal_line}\n\n\
+                 How much do you want to use?\n\
+                 • Type an amount in USD (e.g. `50` = $50)\n\
+                 • Or type a percentage of balance (e.g. `50%`)\n\
+                 • Or tap a quick percentage below:"
+            );
+
+            bot.send_message(chat_id, text)
+                .reply_markup(order_size_keyboard(None))
+                .parse_mode(ParseMode::Markdown)
+                .await?;
         }
         TradeStep::AwaitingUsdAmount => {
-            let cleaned = text.trim().replace('$', "").replace(',', "");
-            let usd = match cleaned.parse::<f64>() {
-                Ok(v) if v > 0.0 => v,
-                _ => {
-                    let cancel_kb = InlineKeyboardMarkup::new(vec![vec![
-                        InlineKeyboardButton::callback("❌ Cancel", "action:cancel"),
-                    ]]);
+            let trimmed = text.trim();
+            let is_percentage = trimmed.contains('%');
+            let usd = if is_percentage {
+                let cleaned = trimmed.replace('%', "").trim();
+                let pct = match cleaned.parse::<f64>() {
+                    Ok(v) if v > 0.0 && v <= 100.0 => v,
+                    _ => {
+                        bot.send_message(
+                            chat_id,
+                            "❌ Please enter a valid percentage between 1% and 100% (e.g. 25%, 50%, 100%) or tap Cancel:",
+                        )
+                        .reply_markup(order_size_keyboard(None))
+                        .await?;
+                        return Ok(());
+                    }
+                };
+
+                let user = match state.users.get_user(user_id).await {
+                    Some(u) => u,
+                    None => {
+                        show_not_connected_notice(bot, chat_id, None).await?;
+                        return Ok(());
+                    }
+                };
+
+                let bal = match state.trading.get_user_balance(&user.account_id, user.indexer_account_id.as_deref()).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        bot.send_message(chat_id, format!("❌ Failed to fetch available balance: {e}")).await?;
+                        return Ok(());
+                    }
+                };
+
+                if bal.available_margin <= 0.0 {
                     bot.send_message(
                         chat_id,
-                        "❌ Please enter a valid USD amount (e.g. 50, 100, 500) or tap Cancel:",
+                        "❌ Available margin is $0.00. Please deposit funds or enter a custom USD amount (e.g. 50):",
                     )
-                    .reply_markup(cancel_kb)
+                    .reply_markup(order_size_keyboard(None))
                     .await?;
                     return Ok(());
+                }
+
+                let calc_usd = ((bal.available_margin * (pct / 100.0) * 100.0).floor()) / 100.0;
+                if calc_usd <= 0.0 {
+                    bot.send_message(
+                        chat_id,
+                        format!("❌ Calculated size from {pct:.0}% is too small (available: ${:.2}). Please enter a USD amount:", bal.available_margin),
+                    )
+                    .reply_markup(order_size_keyboard(None))
+                    .await?;
+                    return Ok(());
+                }
+                calc_usd
+            } else {
+                let cleaned = trimmed.replace('$', "").replace(',', "");
+                match cleaned.parse::<f64>() {
+                    Ok(v) if v > 0.0 => v,
+                    _ => {
+                        bot.send_message(
+                            chat_id,
+                            "❌ Please enter a valid USD amount (e.g. 50, 100) or percentage of balance (e.g. 50%):",
+                        )
+                        .reply_markup(order_size_keyboard(None))
+                        .await?;
+                        return Ok(());
+                    }
                 }
             };
 
@@ -1533,6 +1752,24 @@ async fn handle_trade_step(
                 .parse_mode(ParseMode::Markdown)
                 .await?;
         }
+        TradeStep::AwaitingClosePercentage { market_id: _, symbol } => {
+            state.clear_session(chat_id).await;
+            let cleaned = text.trim().replace('%', "").trim();
+            let pct = match cleaned.parse::<f64>() {
+                Ok(v) if v > 0.0 && v <= 100.0 => v,
+                _ => {
+                    bot.send_message(
+                        chat_id,
+                        "❌ Invalid percentage. Please enter a percentage between 1 and 100 (e.g. 10%, 75%):",
+                    )
+                    .reply_markup(close_options_keyboard(&symbol))
+                    .await?;
+                    return Ok(());
+                }
+            };
+
+            execute_button_close(bot, chat_id, None, user_id, state, &symbol, pct).await?;
+        }
     }
     Ok(())
 }
@@ -1593,9 +1830,10 @@ async fn execute_conversational_trade(
         TradeDirection::Short => ("Short", "📉"),
     };
 
+    let price_decimals = crate::trading::get_cached_market_price_decimals(market_id);
     let price_str = match limit_price {
-        Some(p) => format!("{:.2}", p),
-        None => format!("{:.2}", mark_price),
+        Some(p) => crate::trading::round_price_to_decimals(p, price_decimals).0,
+        None => crate::trading::round_price_to_decimals(mark_price, price_decimals).0,
     };
 
     // Decrypt key into Zeroizing buffer
@@ -1674,7 +1912,7 @@ async fn execute_conversational_trade(
                 price_line,
             );
             bot.send_message(chat_id, text)
-                .reply_markup(back_to_main_keyboard())
+                .reply_markup(order_placed_keyboard(&symbol))
                 .parse_mode(ParseMode::Markdown)
                 .await?;
         }
@@ -1944,12 +2182,21 @@ async fn cmd_long(
     };
     drop(decrypted);
 
-    let text = match res {
-        Ok(ref r) => format_order_result(r),
-        Err(e) => format!("❌ Failed to place order: {e}"),
+    let (text, is_success) = match res {
+        Ok(ref r) => (format_order_result(r), r.success),
+        Err(e) => (format!("❌ Failed to place order: {e}"), false),
+    };
+    let market_sym = match parsed {
+        ParsedOrderArgs::Market { ref market, .. } => BotState::market_name(market),
+        ParsedOrderArgs::Limit { ref market, .. } => BotState::market_name(market),
+    };
+    let kb = if is_success {
+        order_placed_keyboard(&market_sym)
+    } else {
+        back_to_main_keyboard()
     };
     bot.send_message(chat_id, text)
-        .reply_markup(back_to_main_keyboard())
+        .reply_markup(kb)
         .parse_mode(ParseMode::Markdown)
         .await?;
     Ok(())
@@ -2011,12 +2258,21 @@ async fn cmd_short(
     };
     drop(decrypted);
 
-    let text = match res {
-        Ok(ref r) => format_order_result(r),
-        Err(e) => format!("❌ Failed to place order: {e}"),
+    let (text, is_success) = match res {
+        Ok(ref r) => (format_order_result(r), r.success),
+        Err(e) => (format!("❌ Failed to place order: {e}"), false),
+    };
+    let market_sym = match parsed {
+        ParsedOrderArgs::Market { ref market, .. } => BotState::market_name(market),
+        ParsedOrderArgs::Limit { ref market, .. } => BotState::market_name(market),
+    };
+    let kb = if is_success {
+        order_placed_keyboard(&market_sym)
+    } else {
+        back_to_main_keyboard()
     };
     bot.send_message(chat_id, text)
-        .reply_markup(back_to_main_keyboard())
+        .reply_markup(kb)
         .parse_mode(ParseMode::Markdown)
         .await?;
     Ok(())
@@ -2182,7 +2438,8 @@ fn parse_close_args(tokens: &[&str], state: &BotState) -> (String, f64, Option<S
         );
     }
 
-    if let Ok(num) = tokens[0].parse::<f64>() {
+    let token0_clean = tokens[0].trim_end_matches('%');
+    if let Ok(num) = token0_clean.parse::<f64>() {
         let default_m = state.config.default_market.clone().unwrap_or_else(|| "btc".into());
         if num <= 100.0 {
             let price = tokens.get(1).map(|s| s.to_string());
@@ -2198,7 +2455,8 @@ fn parse_close_args(tokens: &[&str], state: &BotState) -> (String, f64, Option<S
         return (market, 100.0, None);
     }
 
-    if let Ok(num) = tokens[1].parse::<f64>() {
+    let token1_clean = tokens[1].trim_end_matches('%');
+    if let Ok(num) = token1_clean.parse::<f64>() {
         if num <= 100.0 {
             let price = tokens.get(2).map(|s| s.to_string());
             (market, num, price)
@@ -2240,10 +2498,11 @@ fn parse_order_input(
                 };
                 return Err(BotError::InvalidArg(err_msg));
             }
+            let (clean_price, _, _) = crate::trading::sanitize_order_price_for_market(&market, price);
             Ok(ParsedOrderArgs::Limit {
                 market,
                 qty: clean_qty,
-                price: price.to_string(),
+                price: clean_price,
             })
         }
         [arg1, arg2] => {
@@ -2276,10 +2535,11 @@ fn parse_order_input(
                     };
                     return Err(BotError::InvalidArg(err_msg));
                 }
+                let (clean_price, _, _) = crate::trading::sanitize_order_price_for_market(&market, arg2);
                 Ok(ParsedOrderArgs::Limit {
                     market,
                     qty: clean_qty,
-                    price: arg2.to_string(),
+                    price: clean_price,
                 })
             }
         }

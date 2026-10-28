@@ -30,6 +30,7 @@ pub enum TradeStep {
     AwaitingOrderType { usd_amount: f64, leverage: f64 },
     AwaitingLimitPrice { usd_amount: f64, leverage: f64 },
     AwaitingAlertTarget { market_id: String, symbol: String },
+    AwaitingClosePercentage { market_id: String, symbol: String },
 }
 
 #[derive(Debug, Clone)]
