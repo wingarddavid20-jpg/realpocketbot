@@ -14,8 +14,8 @@ use sdk::{
     SigningClient,
     crypto::{RawSigner, Signer},
     types::{
-        CancelOrderRequest, OrdersTerminated, Report, SubmitOrderRequest,
-        TradeExecuted, TransactionReport, common::OrderType,
+        CancelOrderRequest, OrderType, OrdersTerminated, Report, SubmitOrderRequest,
+        TradeExecuted, TransactionReport,
     },
 };
 
