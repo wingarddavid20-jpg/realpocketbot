@@ -1553,8 +1553,8 @@ async fn handle_trade_step(
             let trimmed = text.trim();
             let is_percentage = trimmed.contains('%');
             let usd = if is_percentage {
-                let cleaned = trimmed.replace('%', "").trim();
-                let pct = match cleaned.parse::<f64>() {
+                let cleaned = trimmed.replace('%', "");
+                let pct = match cleaned.trim().parse::<f64>() {
                     Ok(v) if v > 0.0 && v <= 100.0 => v,
                     _ => {
                         bot.send_message(
@@ -1754,8 +1754,8 @@ async fn handle_trade_step(
         }
         TradeStep::AwaitingClosePercentage { market_id: _, symbol } => {
             state.clear_session(chat_id).await;
-            let cleaned = text.trim().replace('%', "").trim();
-            let pct = match cleaned.parse::<f64>() {
+            let cleaned = text.trim().replace('%', "");
+            let pct = match cleaned.trim().parse::<f64>() {
                 Ok(v) if v > 0.0 && v <= 100.0 => v,
                 _ => {
                     bot.send_message(
