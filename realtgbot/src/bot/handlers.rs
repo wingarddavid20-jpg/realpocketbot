@@ -268,18 +268,52 @@ async fn edit_or_send(
             .reply_markup(keyboard.clone())
             .parse_mode(ParseMode::Markdown)
             .await;
-        if res.is_ok() {
-            return Ok(());
-        } else if let Err(ref e) = res {
-            warn!("edit_message_text error: {e}");
+        match res {
+            Ok(_) => return Ok(()),
+            Err(ref e) => {
+                let err_str = e.to_string();
+                if err_str.contains("message is not modified") {
+                    return Ok(());
+                }
+                warn!("edit_message_text markdown error: {e}, retrying without parse_mode");
+                let res_plain = bot
+                    .edit_message_text(chat_id, mid, text)
+                    .reply_markup(keyboard.clone())
+                    .await;
+                match res_plain {
+                    Ok(_) => return Ok(()),
+                    Err(ref ep) => {
+                        let ep_str = ep.to_string();
+                        if ep_str.contains("message is not modified") {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
         }
     }
 
-    bot.send_message(chat_id, text)
-        .reply_markup(keyboard)
+    let send_res = bot
+        .send_message(chat_id, text)
+        .reply_markup(keyboard.clone())
         .parse_mode(ParseMode::Markdown)
-        .await?;
-    Ok(())
+        .await;
+
+    if send_res.is_ok() {
+        return Ok(());
+    }
+
+    // Fallback: send as plain text without Markdown parsing if Markdown entity parsing failed
+    match bot.send_message(chat_id, text).reply_markup(keyboard).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if e.to_string().contains("message is not modified") {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 // ─── Dispatcher Entry Points ──────────────────────────────────────────────────
@@ -456,6 +490,8 @@ pub async fn handle_callback(
     } else if data == "action:orders" {
         Box::pin(show_orders_view(&bot, chat_id, Some(message_id), user_id, &state)).await?;
     } else if let Some(rest) = data.strip_prefix("cancel_order:") {
+        Box::pin(handle_cancel_order_button(&bot, chat_id, Some(message_id), user_id, &state, rest)).await?;
+    } else if let Some(rest) = data.strip_prefix("cnl:") {
         Box::pin(handle_cancel_order_button(&bot, chat_id, Some(message_id), user_id, &state, rest)).await?;
     } else if data == "action:history" {
         Box::pin(show_history_view(&bot, chat_id, Some(message_id), user_id, &state)).await?;
@@ -844,7 +880,7 @@ async fn show_orders_view(
             user.indexer_account_id.as_deref(),
         );
 
-    let res = tokio::time::timeout(Duration::from_secs(5), orders_future).await;
+    let res = tokio::time::timeout(Duration::from_millis(3000), orders_future).await;
 
     match res {
         Ok(Ok(orders)) if orders.is_empty() => {
@@ -854,7 +890,7 @@ async fn show_orders_view(
                 vec![InlineKeyboardButton::callback("🔄 Refresh", "action:orders")],
                 vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
             ]);
-            edit_or_send(bot, chat_id, message_id, text, kb).await?;
+            let _ = edit_or_send(bot, chat_id, message_id, text, kb).await;
         }
         Ok(Ok(orders)) => {
             let mut text = format!("📋 *Your Open Limit Orders ({})*\n\n", orders.len());
@@ -892,10 +928,11 @@ async fn show_orders_view(
                     time = time_str,
                 ));
 
+                // Compact callback_data (under 64 bytes limit in Telegram)
                 buttons.push(vec![
                     InlineKeyboardButton::callback(
                         format!("❌ Cancel {side_emoji} {sym} @ ${}", format_usd(ord.price)),
-                        format!("cancel_order:{}:{}", ord.market_id, ord.order_id_str),
+                        format!("cnl:{}:{}", sym.to_lowercase(), ord.order_id_str),
                     )
                 ]);
             }
@@ -905,7 +942,7 @@ async fn show_orders_view(
                 InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main"),
             ]);
             let kb = InlineKeyboardMarkup::new(buttons);
-            edit_or_send(bot, chat_id, message_id, &text, kb).await?;
+            let _ = edit_or_send(bot, chat_id, message_id, &text, kb).await;
         }
         Ok(Err(e)) => {
             let err_text = format!(
@@ -916,7 +953,7 @@ async fn show_orders_view(
                 vec![InlineKeyboardButton::callback("🔄 Retry", "action:orders")],
                 vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
             ]);
-            edit_or_send(bot, chat_id, message_id, &err_text, kb).await?;
+            let _ = edit_or_send(bot, chat_id, message_id, &err_text, kb).await;
         }
         Err(_) => {
             let timeout_text = "⚠️ *Request Timed Out*\n\nThe Real.xyz indexer took too long to respond. Please try refreshing in a few moments.";
@@ -924,7 +961,7 @@ async fn show_orders_view(
                 vec![InlineKeyboardButton::callback("🔄 Retry", "action:orders")],
                 vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
             ]);
-            edit_or_send(bot, chat_id, message_id, timeout_text, kb).await?;
+            let _ = edit_or_send(bot, chat_id, message_id, timeout_text, kb).await;
         }
     }
     Ok(())
@@ -950,7 +987,8 @@ async fn handle_cancel_order_button(
         return Ok(());
     }
 
-    let market_id = parts[0];
+    let market_key = parts[0];
+    let market_id = state.trading.get_market_id(market_key).unwrap_or_else(|| market_key.to_string());
     let order_id: u128 = match parts[1].parse::<u128>() {
         Ok(id) => id,
         Err(_) => {
@@ -975,12 +1013,12 @@ async fn handle_cancel_order_button(
         }
     };
 
-    let market_sym = BotState::market_name(market_id);
-    let mut res = state.trading.cancel_user_order_by_id(&user.account_id, &decrypted, market_id, order_id).await;
+    let market_sym = BotState::market_name(&market_id);
+    let mut res = state.trading.cancel_user_order_by_id(&user.account_id, &decrypted, &market_id, order_id).await;
     if res.as_ref().map_or(false, |c| !c.success) {
         if let Some(ref toid) = user.trading_account_object_id {
             if !toid.eq_ignore_ascii_case(&user.account_id) {
-                if let Ok(retry_cancel) = state.trading.cancel_user_order_by_id(toid, &decrypted, market_id, order_id).await {
+                if let Ok(retry_cancel) = state.trading.cancel_user_order_by_id(toid, &decrypted, &market_id, order_id).await {
                     if retry_cancel.success {
                         res = Ok(retry_cancel);
                     }
@@ -1002,7 +1040,7 @@ async fn handle_cancel_order_button(
                 vec![InlineKeyboardButton::callback("📋 View Open Orders", "action:orders")],
                 vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
             ]);
-            edit_or_send(bot, chat_id, message_id, &text, kb).await?;
+            let _ = edit_or_send(bot, chat_id, message_id, &text, kb).await;
         }
         Ok(_) => {
             let text = format!(
@@ -1014,11 +1052,11 @@ async fn handle_cancel_order_button(
                 vec![InlineKeyboardButton::callback("📋 View Open Orders", "action:orders")],
                 vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
             ]);
-            edit_or_send(bot, chat_id, message_id, &text, kb).await?;
+            let _ = edit_or_send(bot, chat_id, message_id, &text, kb).await;
         }
         Err(e) => {
             let text = format!("❌ *Failed to cancel order*\n\n{e}");
-            edit_or_send(bot, chat_id, message_id, &text, back_to_main_keyboard()).await?;
+            let _ = edit_or_send(bot, chat_id, message_id, &text, back_to_main_keyboard()).await;
         }
     }
 

@@ -1689,33 +1689,34 @@ impl TradingClient {
             id
         );
 
-        let send_res = tokio::time::timeout(
-            Duration::from_secs(4),
-            self.http.get(&url).send()
-        ).await;
+        let fut = async {
+            let resp = self.http.get(&url).send().await
+                .map_err(|e| BotError::Trading(format!("Failed to connect to indexer: {e}")))?;
 
-        let resp = match send_res {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => return Err(BotError::Trading(format!("Failed to connect to indexer: {e}"))),
-            Err(_) => return Err(BotError::Trading("Indexer request timed out".to_string())),
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                debug!("Indexer orders endpoint returned 404 for id {id}");
+                return Ok(serde_json::Value::Null);
+            }
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                warn!("Indexer orders endpoint returned status {status} for id {id}");
+                return Err(BotError::Trading(format!("Indexer returned status {status}")));
+            }
+
+            let val: serde_json::Value = resp
+                .json()
+                .await
+                .unwrap_or(serde_json::Value::Null);
+
+            Ok(val)
         };
 
-        // If user has no orders or account is not indexed yet, indexer returns 404.
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            debug!("Indexer orders endpoint returned 404 for id {id}");
-            return Ok(Vec::new());
-        }
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            warn!("Indexer orders endpoint returned status {status} for id {id}");
-            return Err(BotError::Trading(format!("Indexer returned status {status}")));
-        }
-
-        let val: serde_json::Value = resp
-            .json()
-            .await
-            .unwrap_or(serde_json::Value::Null);
+        let val: serde_json::Value = match tokio::time::timeout(Duration::from_millis(2000), fut).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(BotError::Trading("Indexer request timed out".to_string())),
+        };
 
         if val.is_null() {
             return Ok(Vec::new());
@@ -1887,18 +1888,18 @@ impl TradingClient {
     ) -> BotResult<Vec<OpenLimitOrder>> {
         let mut candidate_ids: Vec<String> = Vec::new();
 
-        // 1. Trading account object ID (on-chain object id e.g. 0x445c... or 0xdbd7...)
+        // 1. Account ID (indexer ID e.g. 0x25fe...) - this is the primary indexer key
+        let acc = account_id.trim();
+        if !acc.is_empty() && !candidate_ids.iter().any(|c| c.eq_ignore_ascii_case(acc)) {
+            candidate_ids.push(acc.to_string());
+        }
+
+        // 2. Trading account object ID (on-chain object id e.g. 0xdbd7...)
         if let Some(toid) = trading_account_obj_id_opt {
             let t = toid.trim();
             if !t.is_empty() && !candidate_ids.iter().any(|c| c.eq_ignore_ascii_case(t)) {
                 candidate_ids.push(t.to_string());
             }
-        }
-
-        // 2. Account ID (e.g. 0xa6af... or 0x25fe...)
-        let acc = account_id.trim();
-        if !acc.is_empty() && !candidate_ids.iter().any(|c| c.eq_ignore_ascii_case(acc)) {
-            candidate_ids.push(acc.to_string());
         }
 
         // 3. Indexer account ID if provided and distinct
@@ -1909,50 +1910,44 @@ impl TradingClient {
             }
         }
 
-        // 4. Resolve indexer internal UUID if not already present
-        if let Some(resolved) = self.resolve_user_indexer_id(account_id).await {
-            let r = resolved.trim();
-            if !r.is_empty() && !candidate_ids.iter().any(|c| c.eq_ignore_ascii_case(r)) {
-                candidate_ids.push(r.to_string());
-            }
+        if candidate_ids.is_empty() {
+            return Ok(Vec::new());
         }
 
         let mut all_orders: Vec<OpenLimitOrder> = Vec::new();
-        let mut last_err = None;
 
-        for cid in &candidate_ids {
-            match self.fetch_orders_from_indexer(cid).await {
-                Ok(mut orders) if !orders.is_empty() => {
-                    for ord in orders.drain(..) {
+        if candidate_ids.len() == 1 {
+            if let Ok(orders) = self.fetch_orders_from_indexer(&candidate_ids[0]).await {
+                all_orders = orders;
+            }
+        } else {
+            let (res1, res2) = tokio::join!(
+                self.fetch_orders_from_indexer(&candidate_ids[0]),
+                self.fetch_orders_from_indexer(&candidate_ids[1])
+            );
+            if let Ok(orders) = res1 {
+                all_orders.extend(orders);
+            }
+            if let Ok(orders) = res2 {
+                for ord in orders {
+                    if !all_orders.iter().any(|existing| existing.order_id_str == ord.order_id_str) {
+                        all_orders.push(ord);
+                    }
+                }
+            }
+            if candidate_ids.len() > 2 {
+                if let Ok(orders) = self.fetch_orders_from_indexer(&candidate_ids[2]).await {
+                    for ord in orders {
                         if !all_orders.iter().any(|existing| existing.order_id_str == ord.order_id_str) {
                             all_orders.push(ord);
                         }
                     }
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    last_err = Some(e);
-                }
             }
         }
 
-        if !all_orders.is_empty() {
-            all_orders.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-            return Ok(all_orders);
-        }
-
-        if candidate_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        if let Some(e) = last_err {
-            if all_orders.is_empty() {
-                // If candidate returned error, still return empty rather than breaking if any returned 404
-                debug!("All candidate lookups completed without active orders (last err: {e})");
-            }
-        }
-
-        Ok(Vec::new())
+        all_orders.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(all_orders)
     }
 
     /// Fetch open orders for default/admin config account.
