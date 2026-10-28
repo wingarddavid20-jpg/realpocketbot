@@ -25,11 +25,30 @@ use crate::{
     error::{BotError, BotResult},
 };
 
-// ─── Global Dynamic Market Names Cache ───────────────────────────────────────
+// ─── Global Dynamic Market Names & Precision Cache ──────────────────────────
 
 /// Global map for instantaneous market_id -> base_asset symbol resolution.
 static CACHED_MARKET_NAMES: std::sync::RwLock<Option<HashMap<String, String>>> =
     std::sync::RwLock::new(None);
+
+/// Global map for instantaneous market_id / symbol / base_asset -> quantity decimal precision.
+static CACHED_MARKET_DECIMALS: std::sync::RwLock<Option<HashMap<String, usize>>> =
+    std::sync::RwLock::new(None);
+
+/// Fallback precision map when indexer does not specify lot size / precision:
+/// BTC → 2 decimals, ETH → 3 decimals, SOL → 3 decimals, default → 3 decimals.
+pub fn fallback_qty_decimals(identifier: &str) -> usize {
+    let clean = identifier.trim().to_uppercase();
+    if clean.starts_with("BTC") {
+        2
+    } else if clean.starts_with("ETH") {
+        3
+    } else if clean.starts_with("SOL") {
+        3
+    } else {
+        3
+    }
+}
 
 pub fn update_cached_market_names(markets: &[MarketInfo]) {
     let mut map = HashMap::new();
@@ -41,12 +60,172 @@ pub fn update_cached_market_names(markets: &[MarketInfo]) {
     }
 }
 
+pub fn update_cached_market_decimals(markets: &[MarketInfo]) {
+    let mut map = HashMap::new();
+    for m in markets {
+        let dec = m.qty_decimals;
+        map.insert(m.market_id.to_lowercase(), dec);
+        map.insert(m.base_asset.to_lowercase(), dec);
+        map.insert(m.symbol.to_lowercase(), dec);
+        map.insert(m.short_name.to_lowercase(), dec);
+    }
+    if let Ok(mut guard) = CACHED_MARKET_DECIMALS.write() {
+        if let Some(ref mut existing) = *guard {
+            for (k, v) in map {
+                existing.insert(k, v);
+            }
+        } else {
+            *guard = Some(map);
+        }
+    }
+}
+
+pub fn set_cached_market_decimals(market_id_or_sym: &str, decimals: usize) {
+    let key = market_id_or_sym.trim().to_lowercase();
+    if let Ok(mut guard) = CACHED_MARKET_DECIMALS.write() {
+        if let Some(ref mut map) = *guard {
+            map.insert(key, decimals);
+        } else {
+            let mut map = HashMap::new();
+            map.insert(key, decimals);
+            *guard = Some(map);
+        }
+    }
+}
+
 pub fn get_cached_market_name(market_id: &str) -> Option<String> {
     if let Ok(guard) = CACHED_MARKET_NAMES.read() {
         if let Some(ref map) = *guard {
             if let Some(name) = map.get(&market_id.to_lowercase()) {
                 return Some(name.clone());
             }
+        }
+    }
+    None
+}
+
+pub fn get_cached_market_decimals(identifier: &str) -> usize {
+    let key = identifier.trim().to_lowercase();
+    if let Ok(guard) = CACHED_MARKET_DECIMALS.read() {
+        if let Some(ref map) = *guard {
+            if let Some(&dec) = map.get(&key) {
+                return dec;
+            }
+        }
+    }
+    if let Some(base_name) = get_cached_market_name(identifier) {
+        if let Ok(guard) = CACHED_MARKET_DECIMALS.read() {
+            if let Some(ref map) = *guard {
+                if let Some(&dec) = map.get(&base_name.to_lowercase()) {
+                    return dec;
+                }
+            }
+        }
+        return fallback_qty_decimals(&base_name);
+    }
+    fallback_qty_decimals(identifier)
+}
+
+/// Parse quantity precision / lot size from indexer ticker payload, with fallback map.
+pub fn parse_qty_decimals(item: &serde_json::Value, base_asset: &str) -> usize {
+    let direct_keys = [
+        "quantity_precision",
+        "qty_precision",
+        "size_decimals",
+        "qty_decimals",
+        "base_asset_precision",
+        "lot_size_decimals",
+    ];
+    for key in direct_keys {
+        if let Some(val) = item.get(key) {
+            if let Some(n) = val.as_u64() {
+                if n <= 8 {
+                    return n as usize;
+                }
+            } else if let Some(s) = val.as_str() {
+                if let Ok(n) = s.parse::<usize>() {
+                    if n <= 8 {
+                        return n;
+                    }
+                }
+            }
+        }
+    }
+
+    let lot_keys = [
+        "lot_size",
+        "step_size",
+        "min_order_size",
+        "min_qty",
+        "min_quantity",
+        "order_size_increment",
+    ];
+    for key in lot_keys {
+        if let Some(val) = item.get(key) {
+            if let Some(s) = val.as_str() {
+                if let Some(pos) = s.find('.') {
+                    let decimals = s[pos + 1..].trim_end_matches('0').len();
+                    if decimals > 0 && decimals <= 8 {
+                        return decimals;
+                    }
+                }
+            } else if let Some(f) = val.as_f64() {
+                if f > 0.0 && f < 1.0 {
+                    let s = format!("{:.8}", f);
+                    if let Some(pos) = s.find('.') {
+                        let decimals = s[pos + 1..].trim_end_matches('0').len();
+                        if decimals > 0 && decimals <= 8 {
+                            return decimals;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fallback_qty_decimals(base_asset)
+}
+
+/// Round a quantity to a specified number of decimal places and format as string.
+/// E.g. round_qty_to_decimals(0.0148, 2) -> ("0.01", 0.01)
+pub fn round_qty_to_decimals(qty: f64, decimals: usize) -> (String, f64) {
+    let factor = 10_f64.powi(decimals as i32);
+    let rounded = (qty * factor).round() / factor;
+    let formatted = format!("{:.prec$}", rounded, prec = decimals);
+    (formatted, rounded)
+}
+
+/// Round and format a string quantity according to a market's allowed decimals.
+pub fn sanitize_order_quantity_for_market(market: &str, qty: &str) -> (String, usize, f64) {
+    let decimals = get_cached_market_decimals(market);
+    if let Ok(val) = qty.parse::<f64>() {
+        let (formatted, rounded) = round_qty_to_decimals(val, decimals);
+        (formatted, decimals, rounded)
+    } else {
+        (qty.to_string(), decimals, 0.0)
+    }
+}
+
+/// Determine whether an error string represents Real.xyz Error 121 (OrderQuantityHasTooManyDecimalPlaces).
+pub fn is_decimal_precision_error(err_str: &str) -> bool {
+    let lower = err_str.to_lowercase();
+    lower.contains("121")
+        || lower.contains("orderquantityhastoomanydecimalplaces")
+        || lower.contains("too many decimal places")
+        || lower.contains("decimal places")
+}
+
+/// Compute one fewer decimal place for retry upon receiving Error 121.
+pub fn next_fewer_decimal_qty(market: &str, current_qty: &str, current_decimals: usize) -> Option<(String, usize)> {
+    if current_decimals == 0 {
+        return None;
+    }
+    let new_decimals = current_decimals - 1;
+    if let Ok(val) = current_qty.parse::<f64>() {
+        let (formatted, rounded) = round_qty_to_decimals(val, new_decimals);
+        if rounded > 0.0 {
+            set_cached_market_decimals(market, new_decimals);
+            return Some((formatted, new_decimals));
         }
     }
     None
@@ -72,6 +251,12 @@ pub struct MarketInfo {
     pub turnover_24h: Option<f64>,
     pub perp_next_funding_rate: Option<f64>,
     pub perp_next_funding_time_ms: Option<u64>,
+    #[serde(default = "default_market_qty_decimals")]
+    pub qty_decimals: usize,
+}
+
+fn default_market_qty_decimals() -> usize {
+    3
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +283,7 @@ pub fn fallback_markets() -> Vec<MarketInfo> {
             turnover_24h: None,
             perp_next_funding_rate: None,
             perp_next_funding_time_ms: None,
+            qty_decimals: 2,
         },
         MarketInfo {
             market_id: ETH_MARKET.to_string(),
@@ -115,6 +301,7 @@ pub fn fallback_markets() -> Vec<MarketInfo> {
             turnover_24h: None,
             perp_next_funding_rate: None,
             perp_next_funding_time_ms: None,
+            qty_decimals: 3,
         },
         MarketInfo {
             market_id: SOL_MARKET.to_string(),
@@ -132,6 +319,7 @@ pub fn fallback_markets() -> Vec<MarketInfo> {
             turnover_24h: None,
             perp_next_funding_rate: None,
             perp_next_funding_time_ms: None,
+            qty_decimals: 3,
         },
         MarketInfo {
             market_id: "0x7fa781f5e1d1da7165cf96e5a6898235f55f2d812dd429d3feed69ff776dfa70".into(),
@@ -149,6 +337,7 @@ pub fn fallback_markets() -> Vec<MarketInfo> {
             turnover_24h: None,
             perp_next_funding_rate: None,
             perp_next_funding_time_ms: None,
+            qty_decimals: 3,
         },
     ]
 }
@@ -290,6 +479,7 @@ impl TradingClient {
         info!("SigningClient created for {:?} network", cfg.network);
         let initial_markets = fallback_markets();
         update_cached_market_names(&initial_markets);
+        update_cached_market_decimals(&initial_markets);
 
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
@@ -305,6 +495,14 @@ impl TradingClient {
 
     pub fn network(&self) -> &Network {
         &self.config.network
+    }
+
+    pub fn get_market_qty_decimals(&self, market_id_or_sym: &str) -> usize {
+        get_cached_market_decimals(market_id_or_sym)
+    }
+
+    pub fn set_market_qty_decimals(&self, market_id_or_sym: &str, decimals: usize) {
+        set_cached_market_decimals(market_id_or_sym, decimals);
     }
 
     /// Fetch dynamic list of active markets from Real.xyz Indexer API.
@@ -391,6 +589,8 @@ impl TradingClient {
             let perp_next_funding_time_ms = item.get("perp_next_funding_time_ms")
                 .and_then(|v| v.as_u64());
 
+            let qty_decimals = parse_qty_decimals(item, &base_asset);
+
             markets.push(MarketInfo {
                 market_id,
                 symbol,
@@ -407,6 +607,7 @@ impl TradingClient {
                 turnover_24h,
                 perp_next_funding_rate,
                 perp_next_funding_time_ms,
+                qty_decimals,
             });
         }
 
@@ -446,6 +647,7 @@ impl TradingClient {
             Ok(fresh_markets) if !fresh_markets.is_empty() => {
                 info!(count = fresh_markets.len(), "Refreshed markets list from Real.xyz indexer");
                 update_cached_market_names(&fresh_markets);
+                update_cached_market_decimals(&fresh_markets);
                 if let Ok(mut guard) = self.markets_cache.write() {
                     guard.markets = fresh_markets.clone();
                     guard.last_updated_secs = now;
@@ -1165,12 +1367,11 @@ impl TradingClient {
 
     // ─── Public Order Operations ────────────────────────────────────────────
 
-    /// Ensure order quantity is rounded to 3 decimal places before submitting to Real.xyz.
-    /// Prevents Real.xyz engine error 121 (OrderQuantityHasTooManyDecimalPlaces).
+    /// Fallback sanitization helper if market is not specified (defaults to 3 decimals).
     pub fn sanitize_order_quantity(qty: &str) -> String {
         if let Ok(val) = qty.parse::<f64>() {
-            let rounded = (val * 1000.0).round() / 1000.0;
-            format!("{:.3}", rounded)
+            let (formatted, _) = round_qty_to_decimals(val, 3);
+            formatted
         } else {
             qty.to_string()
         }
@@ -1182,7 +1383,7 @@ impl TradingClient {
         market: &str,
         quantity: &str,
     ) -> BotResult<OrderResult> {
-        let clean_qty = Self::sanitize_order_quantity(quantity);
+        let (clean_qty, decimals, _) = sanitize_order_quantity_for_market(market, quantity);
         let coid = Uuid::new_v4().to_string();
         let account_id = self.get_effective_account_id().await;
         let order = SubmitOrderRequest::builder()
@@ -1204,8 +1405,35 @@ impl TradingClient {
             .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
         drop(client);
 
-        debug!("place_market_long report: {report:?}");
-        self.parse_order_result(report, "Buy (Market)", &clean_qty, "Market", market, &coid)
+        let mut res = self.parse_order_result(report, "Buy (Market)", &clean_qty, "Market", market, &coid)?;
+
+        if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
+            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
+                info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying market buy with 1 fewer decimal place");
+                let retry_coid = Uuid::new_v4().to_string();
+                if let Ok(retry_order) = SubmitOrderRequest::builder()
+                    .market(market)
+                    .account(&account_id)
+                    .buy()
+                    .market_order()
+                    .quantity(&retry_qty)
+                    .immediate_or_cancel()
+                    .client_order_id(&retry_coid)
+                    .build()
+                {
+                    let retry_req = Uuid::new_v4().to_string();
+                    let client = self.client.lock().await;
+                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                        drop(client);
+                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy (Market)", &retry_qty, "Market", market, &retry_coid) {
+                            res = retry_res;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(res)
     }
 
     /// Place a market sell (short) order with immediate-or-cancel execution.
@@ -1214,7 +1442,7 @@ impl TradingClient {
         market: &str,
         quantity: &str,
     ) -> BotResult<OrderResult> {
-        let clean_qty = Self::sanitize_order_quantity(quantity);
+        let (clean_qty, decimals, _) = sanitize_order_quantity_for_market(market, quantity);
         let coid = Uuid::new_v4().to_string();
         let account_id = self.get_effective_account_id().await;
         let order = SubmitOrderRequest::builder()
@@ -1236,8 +1464,35 @@ impl TradingClient {
             .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
         drop(client);
 
-        debug!("place_market_short report: {report:?}");
-        self.parse_order_result(report, "Sell (Market)", &clean_qty, "Market", market, &coid)
+        let mut res = self.parse_order_result(report, "Sell (Market)", &clean_qty, "Market", market, &coid)?;
+
+        if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
+            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
+                info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying market sell with 1 fewer decimal place");
+                let retry_coid = Uuid::new_v4().to_string();
+                if let Ok(retry_order) = SubmitOrderRequest::builder()
+                    .market(market)
+                    .account(&account_id)
+                    .sell()
+                    .market_order()
+                    .quantity(&retry_qty)
+                    .immediate_or_cancel()
+                    .client_order_id(&retry_coid)
+                    .build()
+                {
+                    let retry_req = Uuid::new_v4().to_string();
+                    let client = self.client.lock().await;
+                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                        drop(client);
+                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell (Market)", &retry_qty, "Market", market, &retry_coid) {
+                            res = retry_res;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(res)
     }
 
     /// Place a reduce-only order to close an open position (market or limit).
@@ -1248,7 +1503,7 @@ impl TradingClient {
         quantity: &str,
         price: Option<&str>,
     ) -> BotResult<OrderResult> {
-        let clean_qty = Self::sanitize_order_quantity(quantity);
+        let (clean_qty, decimals, _) = sanitize_order_quantity_for_market(market, quantity);
         let coid = Uuid::new_v4().to_string();
         let account_id = self.get_effective_account_id().await;
         let mut builder = SubmitOrderRequest::builder();
@@ -1281,9 +1536,44 @@ impl TradingClient {
             .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
         drop(client);
 
-        debug!("place_close_order report: {report:?}");
         let price_label = price.unwrap_or("Market");
-        self.parse_order_result(report, side, &clean_qty, price_label, market, &coid)
+        let mut res = self.parse_order_result(report, side, &clean_qty, price_label, market, &coid)?;
+
+        if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
+            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
+                info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying close order with 1 fewer decimal place");
+                let retry_coid = Uuid::new_v4().to_string();
+                let mut retry_builder = SubmitOrderRequest::builder();
+                retry_builder = retry_builder.market(market).account(&account_id);
+                if side.eq_ignore_ascii_case("buy") {
+                    retry_builder = retry_builder.buy();
+                } else {
+                    retry_builder = retry_builder.sell();
+                }
+                if let Some(p) = price {
+                    retry_builder = retry_builder.limit_order(p).good_till_cancel();
+                } else {
+                    retry_builder = retry_builder.market_order().immediate_or_cancel();
+                }
+                if let Ok(retry_order) = retry_builder
+                    .quantity(&retry_qty)
+                    .reduce_only(true)
+                    .client_order_id(&retry_coid)
+                    .build()
+                {
+                    let retry_req = Uuid::new_v4().to_string();
+                    let client = self.client.lock().await;
+                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                        drop(client);
+                        if let Ok(retry_res) = self.parse_order_result(retry_rep, side, &retry_qty, price_label, market, &retry_coid) {
+                            res = retry_res;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(res)
     }
 
     /// Place a limit buy (long) order.
@@ -1293,7 +1583,7 @@ impl TradingClient {
         quantity: &str,
         price: &str,
     ) -> BotResult<OrderResult> {
-        let clean_qty = Self::sanitize_order_quantity(quantity);
+        let (clean_qty, decimals, _) = sanitize_order_quantity_for_market(market, quantity);
         let coid = Uuid::new_v4().to_string();
         let account_id = self.get_effective_account_id().await;
         let order = SubmitOrderRequest::builder()
@@ -1315,8 +1605,35 @@ impl TradingClient {
             .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
         drop(client);
 
-        debug!("submit_order report: {report:?}");
-        self.parse_order_result(report, "Buy", &clean_qty, price, market, &coid)
+        let mut res = self.parse_order_result(report, "Buy", &clean_qty, price, market, &coid)?;
+
+        if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
+            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
+                info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying limit buy with 1 fewer decimal place");
+                let retry_coid = Uuid::new_v4().to_string();
+                if let Ok(retry_order) = SubmitOrderRequest::builder()
+                    .market(market)
+                    .account(&account_id)
+                    .buy()
+                    .limit_order(price)
+                    .quantity(&retry_qty)
+                    .good_till_cancel()
+                    .client_order_id(&retry_coid)
+                    .build()
+                {
+                    let retry_req = Uuid::new_v4().to_string();
+                    let client = self.client.lock().await;
+                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                        drop(client);
+                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy", &retry_qty, price, market, &retry_coid) {
+                            res = retry_res;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(res)
     }
 
     /// Place a limit sell (short) order.
@@ -1326,7 +1643,7 @@ impl TradingClient {
         quantity: &str,
         price: &str,
     ) -> BotResult<OrderResult> {
-        let clean_qty = Self::sanitize_order_quantity(quantity);
+        let (clean_qty, decimals, _) = sanitize_order_quantity_for_market(market, quantity);
         let coid = Uuid::new_v4().to_string();
         let account_id = self.get_effective_account_id().await;
         let order = SubmitOrderRequest::builder()
@@ -1348,8 +1665,35 @@ impl TradingClient {
             .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
         drop(client);
 
-        debug!("submit_order report: {report:?}");
-        self.parse_order_result(report, "Sell", &clean_qty, price, market, &coid)
+        let mut res = self.parse_order_result(report, "Sell", &clean_qty, price, market, &coid)?;
+
+        if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
+            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
+                info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying limit sell with 1 fewer decimal place");
+                let retry_coid = Uuid::new_v4().to_string();
+                if let Ok(retry_order) = SubmitOrderRequest::builder()
+                    .market(market)
+                    .account(&account_id)
+                    .sell()
+                    .limit_order(price)
+                    .quantity(&retry_qty)
+                    .good_till_cancel()
+                    .client_order_id(&retry_coid)
+                    .build()
+                {
+                    let retry_req = Uuid::new_v4().to_string();
+                    let client = self.client.lock().await;
+                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                        drop(client);
+                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &retry_qty, price, market, &retry_coid) {
+                            res = retry_res;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(res)
     }
 
     /// Cancel all open orders in a given market.
@@ -1417,7 +1761,7 @@ impl TradingClient {
         market: &str,
         quantity: &str,
     ) -> BotResult<OrderResult> {
-        let clean_qty = Self::sanitize_order_quantity(quantity);
+        let (clean_qty, decimals, _) = sanitize_order_quantity_for_market(market, quantity);
         let coid = Uuid::new_v4().to_string();
         let order = SubmitOrderRequest::builder()
             .market(market)
@@ -1436,9 +1780,34 @@ impl TradingClient {
             .submit_order(order, Some(req_id))
             .await
             .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
-        drop(client);
 
-        self.parse_order_result(report, "Buy (Market)", &clean_qty, "Market", market, &coid)
+        let mut res = self.parse_order_result(report, "Buy (Market)", &clean_qty, "Market", market, &coid)?;
+
+        if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
+            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
+                info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying user market buy with 1 fewer decimal place");
+                let retry_coid = Uuid::new_v4().to_string();
+                if let Ok(retry_order) = SubmitOrderRequest::builder()
+                    .market(market)
+                    .account(account_id)
+                    .buy()
+                    .market_order()
+                    .quantity(&retry_qty)
+                    .immediate_or_cancel()
+                    .client_order_id(&retry_coid)
+                    .build()
+                {
+                    let retry_req = Uuid::new_v4().to_string();
+                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy (Market)", &retry_qty, "Market", market, &retry_coid) {
+                            res = retry_res;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(res)
     }
 
     pub async fn place_user_market_short(
@@ -1448,7 +1817,7 @@ impl TradingClient {
         market: &str,
         quantity: &str,
     ) -> BotResult<OrderResult> {
-        let clean_qty = Self::sanitize_order_quantity(quantity);
+        let (clean_qty, decimals, _) = sanitize_order_quantity_for_market(market, quantity);
         let coid = Uuid::new_v4().to_string();
         let order = SubmitOrderRequest::builder()
             .market(market)
@@ -1467,9 +1836,34 @@ impl TradingClient {
             .submit_order(order, Some(req_id))
             .await
             .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
-        drop(client);
 
-        self.parse_order_result(report, "Sell (Market)", &clean_qty, "Market", market, &coid)
+        let mut res = self.parse_order_result(report, "Sell (Market)", &clean_qty, "Market", market, &coid)?;
+
+        if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
+            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
+                info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying user market sell with 1 fewer decimal place");
+                let retry_coid = Uuid::new_v4().to_string();
+                if let Ok(retry_order) = SubmitOrderRequest::builder()
+                    .market(market)
+                    .account(account_id)
+                    .sell()
+                    .market_order()
+                    .quantity(&retry_qty)
+                    .immediate_or_cancel()
+                    .client_order_id(&retry_coid)
+                    .build()
+                {
+                    let retry_req = Uuid::new_v4().to_string();
+                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell (Market)", &retry_qty, "Market", market, &retry_coid) {
+                            res = retry_res;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(res)
     }
 
     pub async fn place_user_limit_long(
@@ -1480,7 +1874,7 @@ impl TradingClient {
         quantity: &str,
         price: &str,
     ) -> BotResult<OrderResult> {
-        let clean_qty = Self::sanitize_order_quantity(quantity);
+        let (clean_qty, decimals, _) = sanitize_order_quantity_for_market(market, quantity);
         let coid = Uuid::new_v4().to_string();
         let order = SubmitOrderRequest::builder()
             .market(market)
@@ -1499,9 +1893,34 @@ impl TradingClient {
             .submit_order(order, Some(req_id))
             .await
             .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
-        drop(client);
 
-        self.parse_order_result(report, "Buy", &clean_qty, price, market, &coid)
+        let mut res = self.parse_order_result(report, "Buy", &clean_qty, price, market, &coid)?;
+
+        if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
+            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
+                info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying user limit buy with 1 fewer decimal place");
+                let retry_coid = Uuid::new_v4().to_string();
+                if let Ok(retry_order) = SubmitOrderRequest::builder()
+                    .market(market)
+                    .account(account_id)
+                    .buy()
+                    .limit_order(price)
+                    .quantity(&retry_qty)
+                    .good_till_cancel()
+                    .client_order_id(&retry_coid)
+                    .build()
+                {
+                    let retry_req = Uuid::new_v4().to_string();
+                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy", &retry_qty, price, market, &retry_coid) {
+                            res = retry_res;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(res)
     }
 
     pub async fn place_user_limit_short(
@@ -1512,7 +1931,7 @@ impl TradingClient {
         quantity: &str,
         price: &str,
     ) -> BotResult<OrderResult> {
-        let clean_qty = Self::sanitize_order_quantity(quantity);
+        let (clean_qty, decimals, _) = sanitize_order_quantity_for_market(market, quantity);
         let coid = Uuid::new_v4().to_string();
         let order = SubmitOrderRequest::builder()
             .market(market)
@@ -1531,9 +1950,34 @@ impl TradingClient {
             .submit_order(order, Some(req_id))
             .await
             .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
-        drop(client);
 
-        self.parse_order_result(report, "Sell", &clean_qty, price, market, &coid)
+        let mut res = self.parse_order_result(report, "Sell", &clean_qty, price, market, &coid)?;
+
+        if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
+            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
+                info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying user limit sell with 1 fewer decimal place");
+                let retry_coid = Uuid::new_v4().to_string();
+                if let Ok(retry_order) = SubmitOrderRequest::builder()
+                    .market(market)
+                    .account(account_id)
+                    .sell()
+                    .limit_order(price)
+                    .quantity(&retry_qty)
+                    .good_till_cancel()
+                    .client_order_id(&retry_coid)
+                    .build()
+                {
+                    let retry_req = Uuid::new_v4().to_string();
+                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &retry_qty, price, market, &retry_coid) {
+                            res = retry_res;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(res)
     }
 
     pub async fn place_user_close_order(
@@ -1545,7 +1989,7 @@ impl TradingClient {
         quantity: &str,
         price: Option<&str>,
     ) -> BotResult<OrderResult> {
-        let clean_qty = Self::sanitize_order_quantity(quantity);
+        let (clean_qty, decimals, _) = sanitize_order_quantity_for_market(market, quantity);
         let coid = Uuid::new_v4().to_string();
         let mut builder = SubmitOrderRequest::builder();
         builder = builder.market(market).account(account_id);
@@ -1575,10 +2019,43 @@ impl TradingClient {
             .submit_order(order, Some(req_id))
             .await
             .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
-        drop(client);
 
         let price_label = price.unwrap_or("Market");
-        self.parse_order_result(report, side, &clean_qty, price_label, market, &coid)
+        let mut res = self.parse_order_result(report, side, &clean_qty, price_label, market, &coid)?;
+
+        if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
+            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
+                info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying user close order with 1 fewer decimal place");
+                let retry_coid = Uuid::new_v4().to_string();
+                let mut retry_builder = SubmitOrderRequest::builder();
+                retry_builder = retry_builder.market(market).account(account_id);
+                if side.eq_ignore_ascii_case("buy") {
+                    retry_builder = retry_builder.buy();
+                } else {
+                    retry_builder = retry_builder.sell();
+                }
+                if let Some(p) = price {
+                    retry_builder = retry_builder.limit_order(p).good_till_cancel();
+                } else {
+                    retry_builder = retry_builder.market_order().immediate_or_cancel();
+                }
+                if let Ok(retry_order) = retry_builder
+                    .quantity(&retry_qty)
+                    .reduce_only(true)
+                    .client_order_id(&retry_coid)
+                    .build()
+                {
+                    let retry_req = Uuid::new_v4().to_string();
+                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                        if let Ok(retry_res) = self.parse_order_result(retry_rep, side, &retry_qty, price_label, market, &retry_coid) {
+                            res = retry_res;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(res)
     }
 
     pub async fn cancel_user_all_orders(

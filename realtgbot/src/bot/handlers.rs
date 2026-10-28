@@ -1273,11 +1273,14 @@ async fn execute_button_close(
         }
     };
 
+    let decimals = crate::trading::get_cached_market_decimals(&sym_upper);
+    let min_size = 1.0 / 10_f64.powi(decimals as i32);
     let close_fraction = (pct / 100.0).clamp(0.01, 1.0);
     let raw_close_qty = if pct >= 99.9 { pos.size } else { pos.size * close_fraction };
-    let mut qty_str = format_asset_qty(&sym_upper, raw_close_qty);
-    if qty_str.parse::<f64>().unwrap_or(0.0) <= 0.0 && pos.size > 0.0 {
-        qty_str = format_asset_qty(&sym_upper, pos.size.min(0.001));
+    let (mut qty_str, rounded_close_qty) = crate::trading::round_qty_to_decimals(raw_close_qty, decimals);
+    if rounded_close_qty <= 0.0 && pos.size > 0.0 {
+        let (fallback_str, _) = crate::trading::round_qty_to_decimals(pos.size.min(min_size), decimals);
+        qty_str = fallback_str;
     }
 
     let is_pos_long = pos.direction.eq_ignore_ascii_case("long") || pos.direction.eq_ignore_ascii_case("buy");
@@ -1572,14 +1575,16 @@ async fn execute_conversational_trade(
     let total_notional = usd_amount * leverage;
     let raw_qty = total_notional / exec_price;
 
-    let qty_str = format_asset_qty(symbol, raw_qty);
+    let decimals = crate::trading::get_cached_market_decimals(market_id);
+    let (qty_str, rounded_qty) = crate::trading::round_qty_to_decimals(raw_qty, decimals);
 
-    let parsed_qty = qty_str.parse::<f64>().unwrap_or(0.0);
-    if parsed_qty <= 0.0 {
+    if rounded_qty <= 0.0 {
+        let min_size = 1.0 / 10_f64.powi(decimals as i32);
         bot.send_message(
             chat_id,
             format!(
-                "❌ Order size for {symbol} ({qty_str}) is too small (minimum 0.001). Please increase your USD amount or leverage."
+                "❌ Order size for {symbol} is too small (minimum {min_size:.decimals$}). Please increase your USD amount or leverage.",
+                decimals = decimals
             ),
         )
         .reply_markup(back_to_main_keyboard())
@@ -1611,6 +1616,10 @@ async fn execute_conversational_trade(
         }
     };
 
+    // CRITICAL ORDER FLOW GUARANTEE:
+    // Strictly place ONLY the user-requested directional order.
+    // Under no circumstances place an opposing order, auto-hedge, or auto-close.
+    // The position remains open until the user manually triggers a close.
     let res = match (direction, order_type) {
         (TradeDirection::Long, crate::bot::state::OrderTypeChoice::Market) => {
             state.trading.place_user_market_long(&user.account_id, &decrypted, market_id, &qty_str).await
@@ -1872,6 +1881,7 @@ async fn cmd_balance(bot: &Bot, chat_id: ChatId, user_id: u64, state: &BotState)
 }
 
 async fn cmd_volume(bot: &Bot, chat_id: ChatId, user_id: u64, state: &BotState) -> ResponseResult<()> {
+    // /volume strictly displays user trading volume statistics; it NEVER places any orders.
     show_volume_view(bot, chat_id, None, user_id, state).await
 }
 
@@ -1895,47 +1905,57 @@ async fn cmd_long(
 
     let tokens: Vec<&str> = args.split_whitespace().collect();
 
-    if tokens.len() == 3 {
-        let (market, qty, price) = match parse_order_args(args, state) {
-            Ok(v) => v,
-            Err(e) => {
-                bot.send_message(chat_id, e.user_message()).await?;
-                return Ok(());
-            }
-        };
-        send_typing(bot, chat_id).await;
-
-        let user = state.users.get_user(user_id).await.unwrap();
-        let decrypted = match crate::crypto::decrypt_user_key(&state.config.encryption_key, user_id, &user.encrypted_privkey) {
-            Ok(k) => k,
-            Err(e) => {
-                bot.send_message(chat_id, format!("❌ Decryption error: {e}")).await?;
-                return Ok(());
-            }
-        };
-
-        let res = state
-            .trading
-            .place_user_limit_long(&user.account_id, &decrypted, &market, &qty, &price)
-            .await;
-        drop(decrypted);
-
-        let text = match res {
-            Ok(ref r) => format_order_result(r),
-            Err(e) => format!("❌ Failed to place limit order: {e}"),
-        };
-        bot.send_message(chat_id, text)
-            .reply_markup(back_to_main_keyboard())
-            .parse_mode(ParseMode::Markdown)
-            .await?;
+    if tokens.is_empty() {
+        show_markets_menu(bot, chat_id, None, state).await?;
         return Ok(());
     }
 
     if tokens.len() == 1 {
         start_trade_from_button(bot, chat_id, None, user_id, state, TradeDirection::Long, tokens[0]).await?;
-    } else {
-        show_markets_menu(bot, chat_id, None, state).await?;
+        return Ok(());
     }
+
+    let parsed = match parse_order_input(args, state) {
+        Ok(p) => p,
+        Err(e) => {
+            bot.send_message(chat_id, e.user_message()).await?;
+            return Ok(());
+        }
+    };
+
+    send_typing(bot, chat_id).await;
+
+    let user = state.users.get_user(user_id).await.unwrap();
+    let decrypted = match crate::crypto::decrypt_user_key(&state.config.encryption_key, user_id, &user.encrypted_privkey) {
+        Ok(k) => k,
+        Err(e) => {
+            bot.send_message(chat_id, format!("❌ Decryption error: {e}")).await?;
+            return Ok(());
+        }
+    };
+
+    // CRITICAL ORDER FLOW GUARANTEE:
+    // Strictly execute ONLY the single requested long order.
+    // Under no circumstances place an opposing short, hedge, or auto-closing order.
+    // The position remains open until the user manually triggers a close.
+    let res = match parsed {
+        ParsedOrderArgs::Market { ref market, ref qty } => {
+            state.trading.place_user_market_long(&user.account_id, &decrypted, market, qty).await
+        }
+        ParsedOrderArgs::Limit { ref market, ref qty, ref price } => {
+            state.trading.place_user_limit_long(&user.account_id, &decrypted, market, qty, price).await
+        }
+    };
+    drop(decrypted);
+
+    let text = match res {
+        Ok(ref r) => format_order_result(r),
+        Err(e) => format!("❌ Failed to place order: {e}"),
+    };
+    bot.send_message(chat_id, text)
+        .reply_markup(back_to_main_keyboard())
+        .parse_mode(ParseMode::Markdown)
+        .await?;
     Ok(())
 }
 
@@ -1952,47 +1972,57 @@ async fn cmd_short(
 
     let tokens: Vec<&str> = args.split_whitespace().collect();
 
-    if tokens.len() == 3 {
-        let (market, qty, price) = match parse_order_args(args, state) {
-            Ok(v) => v,
-            Err(e) => {
-                bot.send_message(chat_id, e.user_message()).await?;
-                return Ok(());
-            }
-        };
-        send_typing(bot, chat_id).await;
-
-        let user = state.users.get_user(user_id).await.unwrap();
-        let decrypted = match crate::crypto::decrypt_user_key(&state.config.encryption_key, user_id, &user.encrypted_privkey) {
-            Ok(k) => k,
-            Err(e) => {
-                bot.send_message(chat_id, format!("❌ Decryption error: {e}")).await?;
-                return Ok(());
-            }
-        };
-
-        let res = state
-            .trading
-            .place_user_limit_short(&user.account_id, &decrypted, &market, &qty, &price)
-            .await;
-        drop(decrypted);
-
-        let text = match res {
-            Ok(ref r) => format_order_result(r),
-            Err(e) => format!("❌ Failed to place limit order: {e}"),
-        };
-        bot.send_message(chat_id, text)
-            .reply_markup(back_to_main_keyboard())
-            .parse_mode(ParseMode::Markdown)
-            .await?;
+    if tokens.is_empty() {
+        show_markets_menu(bot, chat_id, None, state).await?;
         return Ok(());
     }
 
     if tokens.len() == 1 {
         start_trade_from_button(bot, chat_id, None, user_id, state, TradeDirection::Short, tokens[0]).await?;
-    } else {
-        show_markets_menu(bot, chat_id, None, state).await?;
+        return Ok(());
     }
+
+    let parsed = match parse_order_input(args, state) {
+        Ok(p) => p,
+        Err(e) => {
+            bot.send_message(chat_id, e.user_message()).await?;
+            return Ok(());
+        }
+    };
+
+    send_typing(bot, chat_id).await;
+
+    let user = state.users.get_user(user_id).await.unwrap();
+    let decrypted = match crate::crypto::decrypt_user_key(&state.config.encryption_key, user_id, &user.encrypted_privkey) {
+        Ok(k) => k,
+        Err(e) => {
+            bot.send_message(chat_id, format!("❌ Decryption error: {e}")).await?;
+            return Ok(());
+        }
+    };
+
+    // CRITICAL ORDER FLOW GUARANTEE:
+    // Strictly execute ONLY the single requested short order.
+    // Under no circumstances place an opposing long, hedge, or auto-closing order.
+    // The position remains open until the user manually triggers a close.
+    let res = match parsed {
+        ParsedOrderArgs::Market { ref market, ref qty } => {
+            state.trading.place_user_market_short(&user.account_id, &decrypted, market, qty).await
+        }
+        ParsedOrderArgs::Limit { ref market, ref qty, ref price } => {
+            state.trading.place_user_limit_short(&user.account_id, &decrypted, market, qty, price).await
+        }
+    };
+    drop(decrypted);
+
+    let text = match res {
+        Ok(ref r) => format_order_result(r),
+        Err(e) => format!("❌ Failed to place order: {e}"),
+    };
+    bot.send_message(chat_id, text)
+        .reply_markup(back_to_main_keyboard())
+        .parse_mode(ParseMode::Markdown)
+        .await?;
     Ok(())
 }
 
@@ -2065,11 +2095,14 @@ async fn cmd_close(
         }
     };
 
+    let decimals = crate::trading::get_cached_market_decimals(&symbol);
+    let min_size = 1.0 / 10_f64.powi(decimals as i32);
     let close_fraction = (percentage / 100.0).clamp(0.01, 1.0);
     let raw_close_qty = if percentage >= 99.9 { pos.size } else { pos.size * close_fraction };
-    let mut qty_str = format_asset_qty(&symbol, raw_close_qty);
-    if qty_str.parse::<f64>().unwrap_or(0.0) <= 0.0 && pos.size > 0.0 {
-        qty_str = format_asset_qty(&symbol, pos.size.min(0.001));
+    let (mut qty_str, rounded_close_qty) = crate::trading::round_qty_to_decimals(raw_close_qty, decimals);
+    if rounded_close_qty <= 0.0 && pos.size > 0.0 {
+        let (fallback_str, _) = crate::trading::round_qty_to_decimals(pos.size.min(min_size), decimals);
+        qty_str = fallback_str;
     }
 
     let is_pos_long = pos.direction.eq_ignore_ascii_case("long") || pos.direction.eq_ignore_ascii_case("buy");
@@ -2183,10 +2216,15 @@ fn parse_close_args(tokens: &[&str], state: &BotState) -> (String, f64, Option<S
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-fn parse_order_args(
+enum ParsedOrderArgs {
+    Limit { market: String, qty: String, price: String },
+    Market { market: String, qty: String },
+}
+
+fn parse_order_input(
     args: &str,
     state: &BotState,
-) -> Result<(String, String, String), BotError> {
+) -> Result<ParsedOrderArgs, BotError> {
     let parts: Vec<&str> = args.split_whitespace().collect();
     match parts.as_slice() {
         [market_arg, qty, price] => {
@@ -2196,41 +2234,78 @@ fn parse_order_args(
                     state.available_markets_summary()
                 ))
             })?;
-            let clean_qty = crate::trading::TradingClient::sanitize_order_quantity(qty);
-            Ok((market, clean_qty, price.to_string()))
+            let (clean_qty, decimals, rounded) = crate::trading::sanitize_order_quantity_for_market(&market, qty);
+            if rounded <= 0.0 {
+                let min_size = 1.0 / 10_f64.powi(decimals as i32);
+                return Err(BotError::InvalidArg(format!(
+                    "Order size must be at least {min_size:.decimals$}",
+                    decimals = decimals
+                )));
+            }
+            Ok(ParsedOrderArgs::Limit {
+                market,
+                qty: clean_qty,
+                price: price.to_string(),
+            })
         }
-        [qty, price] => {
-            let market = state
-                .resolve_market("")
-                .ok_or(BotError::NoDefaultMarket)?;
-            let clean_qty = crate::trading::TradingClient::sanitize_order_quantity(qty);
-            Ok((market, clean_qty, price.to_string()))
+        [arg1, arg2] => {
+            if let Some(market) = state.resolve_market(arg1) {
+                let (clean_qty, decimals, rounded) = crate::trading::sanitize_order_quantity_for_market(&market, arg2);
+                if rounded <= 0.0 {
+                    let min_size = 1.0 / 10_f64.powi(decimals as i32);
+                    return Err(BotError::InvalidArg(format!(
+                        "Order size must be at least {min_size:.decimals$}",
+                        decimals = decimals
+                    )));
+                }
+                Ok(ParsedOrderArgs::Market {
+                    market,
+                    qty: clean_qty,
+                })
+            } else {
+                let market = state
+                    .resolve_market("")
+                    .ok_or(BotError::NoDefaultMarket)?;
+                let (clean_qty, decimals, rounded) = crate::trading::sanitize_order_quantity_for_market(&market, arg1);
+                if rounded <= 0.0 {
+                    let min_size = 1.0 / 10_f64.powi(decimals as i32);
+                    return Err(BotError::InvalidArg(format!(
+                        "Order size must be at least {min_size:.decimals$}",
+                        decimals = decimals
+                    )));
+                }
+                Ok(ParsedOrderArgs::Limit {
+                    market,
+                    qty: clean_qty,
+                    price: arg2.to_string(),
+                })
+            }
         }
         _ => Err(BotError::InvalidArg(
-            "Usage: /long <market> <size> <price>\nExample: /long btc 0.1 82000".into(),
+            "Usage:\n• /long <market> (interactive)\n• /long <market> <size> (market order)\n• /long <market> <size> <price> (limit order)\n\nExample: `/long btc 0.1` or `/long btc 0.1 82000`".into(),
         )),
     }
 }
 
 fn format_order_result(r: &crate::trading::OrderResult) -> String {
-    let side_emoji = if r.side.eq_ignore_ascii_case("buy") { "📈" } else { "📉" };
+    let side_emoji = if r.side.to_lowercase().contains("buy") { "📈" } else { "📉" };
     let status_emoji = if r.success { "✅" } else { "❌" };
     let market_display = BotState::market_name(&r.market);
 
     let mut text = format!(
-        "{status_emoji} {side_emoji} *Limit {side}*\n\n\
-         Market: *{market_display}*\n\
-         Qty: `{}`\n\
-         Price: `${}`\n\
-         Client ID: `{}`",
+        "{status_emoji} {side_emoji} *{} Order*\n\n\
+         • Market: *{market_display}*\n\
+         • Size: `{}`\n\
+         • Price: `${}`\n\
+         • Client ID: `{}`",
+        r.side,
         r.quantity,
         r.price,
         r.client_order_id,
-        side = r.side.to_uppercase(),
     );
 
     if let Some(ref oid) = r.order_id {
-        text.push_str(&format!("\nOrder ID: `{oid}`"));
+        text.push_str(&format!("\n• Order ID: `{oid}`"));
     }
 
     if !r.fills.is_empty() {
@@ -2262,11 +2337,12 @@ fn format_usd(val: f64) -> String {
     }
 }
 
-/// Format order quantity (size) rounded to 3 decimal places before submitting to Real.xyz.
+/// Format order quantity (size) rounded to the market's allowed decimals before submitting to Real.xyz.
 /// Prevents Real.xyz engine error 121 (OrderQuantityHasTooManyDecimalPlaces).
-fn format_asset_qty(_symbol: impl AsRef<str>, qty: f64) -> String {
-    let rounded = (qty * 1000.0).round() / 1000.0;
-    format!("{:.3}", rounded)
+fn format_asset_qty(symbol: impl AsRef<str>, qty: f64) -> String {
+    let decimals = crate::trading::get_cached_market_decimals(symbol.as_ref());
+    let (formatted, _) = crate::trading::round_qty_to_decimals(qty, decimals);
+    formatted
 }
 
 fn format_volume(val: f64) -> String {
