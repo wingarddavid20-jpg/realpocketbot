@@ -8,6 +8,8 @@ use crate::{alerts::AlertStore, config::Config, trading::TradingClient, users::U
 pub const BTC_MARKET: &str = "0x03d9f492be9ec3289c0ecbd5b60e9df3c8c74bb5fd51f697a2b85f065f51a9d5";
 pub const ETH_MARKET: &str = "0xc677aafef3f33649973c8d86acb0f929f54fe1a6168b200399b9465d9e0fd00c";
 pub const SOL_MARKET: &str = "0xca22f2b22f8c16be70d29e5cc8434bedb778c51d6cb224b64c3ee7d152567936";
+pub const HYPE_MARKET: &str = "0x7fa781f5e1d1da7165cf96e5a6898235f55f2d812dd429d3feed69ff776dfa70";
+pub const XAUT_MARKET: &str = "0x16e576efa4a6f5e27380390c100196c91f89abc5e07307d0e342ed0e61823cd6";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradeDirection {
@@ -108,8 +110,10 @@ impl BotState {
             "ETH".into()
         } else if market_id.eq_ignore_ascii_case(SOL_MARKET) {
             "SOL".into()
-        } else if market_id.eq_ignore_ascii_case("0x7fa781f5e1d1da7165cf96e5a6898235f55f2d812dd429d3feed69ff776dfa70") {
+        } else if market_id.eq_ignore_ascii_case(HYPE_MARKET) {
             "HYPE".into()
+        } else if market_id.eq_ignore_ascii_case(XAUT_MARKET) {
+            "XAUT".into()
         } else if market_id.len() > 10 {
             format!("{}…{}", &market_id[..6], &market_id[market_id.len() - 4..])
         } else {

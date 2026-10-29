@@ -20,7 +20,7 @@ use sdk::{
 };
 
 use crate::{
-    bot::state::{BTC_MARKET, ETH_MARKET, SOL_MARKET},
+    bot::state::{BTC_MARKET, ETH_MARKET, HYPE_MARKET, SOL_MARKET, XAUT_MARKET},
     config::{Config, Network},
     error::{BotError, BotResult},
 };
@@ -47,16 +47,18 @@ static CACHED_MARKET_PRICE_DECIMALS: std::sync::RwLock<Option<HashMap<String, us
 static CACHED_MARKET_MAX_LEVERAGE: std::sync::RwLock<Option<HashMap<String, f64>>> =
     std::sync::RwLock::new(None);
 
-/// Fallback max leverage per market (e.g. BTC 40x, ETH 25x, SOL 20x, HYPE 20x, default 20x).
+/// Fallback max leverage per market (e.g. BTC 40x, ETH 25x, SOL 20x, HYPE 20x, XAUT 20x, default 20x).
 pub fn fallback_max_leverage(identifier: &str) -> f64 {
     let clean = identifier.trim().to_uppercase();
-    if clean.starts_with("BTC") {
+    if clean.starts_with("BTC") || clean.eq_ignore_ascii_case(BTC_MARKET) {
         40.0
-    } else if clean.starts_with("ETH") {
+    } else if clean.starts_with("ETH") || clean.eq_ignore_ascii_case(ETH_MARKET) {
         25.0
-    } else if clean.starts_with("SOL") {
+    } else if clean.starts_with("SOL") || clean.eq_ignore_ascii_case(SOL_MARKET) {
         20.0
-    } else if clean.starts_with("HYPE") {
+    } else if clean.starts_with("HYPE") || clean.eq_ignore_ascii_case(HYPE_MARKET) {
+        20.0
+    } else if clean.starts_with("XAUT") || clean.eq_ignore_ascii_case(XAUT_MARKET) {
         20.0
     } else {
         20.0
@@ -66,59 +68,63 @@ pub fn fallback_max_leverage(identifier: &str) -> f64 {
 /// Fallback precision map matching Real.xyz engine order rules (size_decimal_places):
 /// BTC → 4 decimals (lot size 0.0001), ETH → 3 decimals (lot size 0.001),
 /// SOL → 2 decimals (lot size 0.01), HYPE → 2 decimals (lot size 0.01),
-/// DOGE/XRP → 0 decimals, default → 3 decimals.
+/// XAUT → 3 decimals (lot size 0.001), DOGE/XRP → 0 decimals, default → 2 decimals.
 pub fn fallback_qty_decimals(identifier: &str) -> usize {
     let clean = identifier.trim().to_uppercase();
-    if clean.starts_with("BTC") {
+    if clean.starts_with("BTC") || clean.eq_ignore_ascii_case(BTC_MARKET) {
         4
-    } else if clean.starts_with("ETH") {
+    } else if clean.starts_with("ETH") || clean.eq_ignore_ascii_case(ETH_MARKET) {
         3
-    } else if clean.starts_with("SOL") {
+    } else if clean.starts_with("SOL") || clean.eq_ignore_ascii_case(SOL_MARKET) {
         2
-    } else if clean.starts_with("HYPE") {
+    } else if clean.starts_with("HYPE") || clean.eq_ignore_ascii_case(HYPE_MARKET) {
         2
+    } else if clean.starts_with("XAUT") || clean.eq_ignore_ascii_case(XAUT_MARKET) {
+        3
     } else if clean.starts_with("DOGE") || clean.starts_with("XRP") {
         0
     } else if clean.starts_with("BNB") || clean.starts_with("ZEC") {
         2
     } else {
-        3
+        2
     }
 }
 
 pub fn fallback_market_lot_size(identifier: &str) -> f64 {
     let clean = identifier.trim().to_uppercase();
-    if clean.starts_with("BTC") {
+    if clean.starts_with("BTC") || clean.eq_ignore_ascii_case(BTC_MARKET) {
         0.0001
-    } else if clean.starts_with("ETH") {
+    } else if clean.starts_with("ETH") || clean.eq_ignore_ascii_case(ETH_MARKET) {
         0.001
-    } else if clean.starts_with("SOL") {
+    } else if clean.starts_with("SOL") || clean.eq_ignore_ascii_case(SOL_MARKET) {
         0.01
-    } else if clean.starts_with("HYPE") {
+    } else if clean.starts_with("HYPE") || clean.eq_ignore_ascii_case(HYPE_MARKET) {
         0.01
+    } else if clean.starts_with("XAUT") || clean.eq_ignore_ascii_case(XAUT_MARKET) {
+        0.001
     } else if clean.starts_with("DOGE") {
         10.0
     } else if clean.starts_with("XRP") {
         1.0
     } else {
-        0.001
+        0.01
     }
 }
 
 pub fn fallback_price_decimals(identifier: &str) -> usize {
     let clean = identifier.trim().to_uppercase();
-    if clean.starts_with("BTC") {
+    if clean.starts_with("BTC") || clean.eq_ignore_ascii_case(BTC_MARKET) {
         1
-    } else if clean.starts_with("ETH") {
+    } else if clean.starts_with("ETH") || clean.eq_ignore_ascii_case(ETH_MARKET) {
         2
-    } else if clean.starts_with("SOL") {
+    } else if clean.starts_with("SOL") || clean.eq_ignore_ascii_case(SOL_MARKET) {
         3
-    } else if clean.starts_with("HYPE") {
+    } else if clean.starts_with("HYPE") || clean.eq_ignore_ascii_case(HYPE_MARKET) {
         3
-    } else if clean.starts_with("XAUT") {
+    } else if clean.starts_with("XAUT") || clean.eq_ignore_ascii_case(XAUT_MARKET) {
         2
     } else {
-        1
+        2
     }
 }
 
@@ -423,12 +429,22 @@ pub fn round_qty_to_decimals(qty: f64, decimals: usize) -> (String, f64) {
     (formatted, rounded)
 }
 
-/// Round and format a string quantity according to a market's allowed decimals.
+/// Floor a quantity to a specified number of decimal places and format as string.
+/// Unlike round_qty_to_decimals, this never rounds up, guaranteeing that the
+/// required margin never exceeds the intended USD allocation.
+pub fn floor_qty_to_decimals(qty: f64, decimals: usize) -> (String, f64) {
+    let factor = 10_f64.powi(decimals as i32);
+    let floored = (qty * factor).floor() / factor;
+    let formatted = format!("{:.prec$}", floored, prec = decimals);
+    (formatted, floored)
+}
+
+/// Floor and format a string quantity according to a market's allowed decimals.
 pub fn sanitize_order_quantity_for_market(market: &str, qty: &str) -> (String, usize, f64) {
     let decimals = get_cached_market_decimals(market);
     if let Ok(val) = qty.parse::<f64>() {
-        let (formatted, rounded) = round_qty_to_decimals(val, decimals);
-        (formatted, decimals, rounded)
+        let (formatted, floored) = floor_qty_to_decimals(val, decimals);
+        (formatted, decimals, floored)
     } else {
         (qty.to_string(), decimals, 0.0)
     }
@@ -450,8 +466,8 @@ pub fn next_fewer_decimal_qty(market: &str, current_qty: &str, current_decimals:
     }
     let new_decimals = current_decimals - 1;
     if let Ok(val) = current_qty.parse::<f64>() {
-        let (formatted, rounded) = round_qty_to_decimals(val, new_decimals);
-        if rounded > 0.0 {
+        let (formatted, floored) = floor_qty_to_decimals(val, new_decimals);
+        if floored > 0.0 {
             set_cached_market_decimals(market, new_decimals);
             return Some((formatted, new_decimals));
         }
@@ -487,6 +503,15 @@ pub fn is_price_decimal_error(err_str: &str) -> bool {
     lower.contains("114")
         || lower.contains("orderpricehastoomanydecimalplaces")
         || lower.contains("price has too many decimal places")
+}
+
+/// Determine whether an error string represents an Insufficient Margin error from Real.xyz matching engine.
+pub fn is_insufficient_margin_error(err_str: &str) -> bool {
+    let lower = err_str.to_lowercase();
+    lower.contains("insufficientmargin")
+        || lower.contains("insufficient margin")
+        || lower.contains("not enough margin")
+        || lower.contains("insufficient balance")
 }
 
 /// Helper to get next fewer decimal place for price if Error 114 occurs.
@@ -626,7 +651,7 @@ pub fn fallback_markets() -> Vec<MarketInfo> {
             max_leverage: 20.0,
         },
         MarketInfo {
-            market_id: "0x7fa781f5e1d1da7165cf96e5a6898235f55f2d812dd429d3feed69ff776dfa70".into(),
+            market_id: HYPE_MARKET.to_string(),
             symbol: "HYPE-USDT".into(),
             base_asset: "HYPE".into(),
             quote_asset: "USDT".into(),
@@ -644,6 +669,27 @@ pub fn fallback_markets() -> Vec<MarketInfo> {
             qty_decimals: 2,
             lot_size: 0.01,
             price_decimals: 3,
+            max_leverage: 20.0,
+        },
+        MarketInfo {
+            market_id: XAUT_MARKET.to_string(),
+            symbol: "XAUT-USDT".into(),
+            base_asset: "XAUT".into(),
+            quote_asset: "USDT".into(),
+            short_name: "xaut".into(),
+            mark_price: 0.0,
+            index_price: 0.0,
+            last_traded_price: None,
+            price_change_24h: None,
+            high_price_24h: None,
+            low_price_24h: None,
+            volume_24h: None,
+            turnover_24h: None,
+            perp_next_funding_rate: None,
+            perp_next_funding_time_ms: None,
+            qty_decimals: 3,
+            lot_size: 0.001,
+            price_decimals: 2,
             max_leverage: 20.0,
         },
     ]
@@ -801,6 +847,8 @@ impl TradingClient {
         let initial_markets = fallback_markets();
         update_cached_market_names(&initial_markets);
         update_cached_market_decimals(&initial_markets);
+        update_cached_market_lot_sizes(&initial_markets);
+        update_cached_market_price_decimals(&initial_markets);
         update_cached_market_max_leverage(&initial_markets);
 
         let http = reqwest::Client::builder()
@@ -2115,7 +2163,7 @@ impl TradingClient {
     /// Fallback sanitization helper if market is not specified (defaults to 3 decimals).
     pub fn sanitize_order_quantity(qty: &str) -> String {
         if let Ok(val) = qty.parse::<f64>() {
-            let (formatted, _) = round_qty_to_decimals(val, 3);
+            let (formatted, _) = floor_qty_to_decimals(val, 3);
             formatted
         } else {
             qty.to_string()
@@ -2710,6 +2758,34 @@ impl TradingClient {
             }
         }
 
+        if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
+            if let Ok(val) = clean_qty.parse::<f64>() {
+                let reduced_val = val * 0.90;
+                let (retry_qty, floored) = floor_qty_to_decimals(reduced_val, decimals);
+                if floored > 0.0 && retry_qty != clean_qty {
+                    info!(market = %market, old_qty = %clean_qty, retry_qty = %retry_qty, "Retrying user market buy with 10% reduced size after InsufficientMargin");
+                    let retry_coid = Uuid::new_v4().to_string();
+                    if let Ok(retry_order) = SubmitOrderRequest::builder()
+                        .market(market)
+                        .account(account_id)
+                        .buy()
+                        .market_order()
+                        .quantity(&retry_qty)
+                        .immediate_or_cancel()
+                        .client_order_id(&retry_coid)
+                        .build()
+                    {
+                        let retry_req = Uuid::new_v4().to_string();
+                        if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                            if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy (Market)", &retry_qty, "Market", market, &retry_coid) {
+                                res = retry_res;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(res)
     }
 
@@ -2760,6 +2836,34 @@ impl TradingClient {
                     if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
                         if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell (Market)", &retry_qty, "Market", market, &retry_coid) {
                             res = retry_res;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
+            if let Ok(val) = clean_qty.parse::<f64>() {
+                let reduced_val = val * 0.90;
+                let (retry_qty, floored) = floor_qty_to_decimals(reduced_val, decimals);
+                if floored > 0.0 && retry_qty != clean_qty {
+                    info!(market = %market, old_qty = %clean_qty, retry_qty = %retry_qty, "Retrying user market sell with 10% reduced size after InsufficientMargin");
+                    let retry_coid = Uuid::new_v4().to_string();
+                    if let Ok(retry_order) = SubmitOrderRequest::builder()
+                        .market(market)
+                        .account(account_id)
+                        .sell()
+                        .market_order()
+                        .quantity(&retry_qty)
+                        .immediate_or_cancel()
+                        .client_order_id(&retry_coid)
+                        .build()
+                    {
+                        let retry_req = Uuid::new_v4().to_string();
+                        if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                            if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell (Market)", &retry_qty, "Market", market, &retry_coid) {
+                                res = retry_res;
+                            }
                         }
                     }
                 }

@@ -1565,7 +1565,17 @@ async fn handle_order_size_percentage(
         return Ok(());
     }
 
-    let usd = ((bal.available_margin * (pct / 100.0) * 100.0).floor()) / 100.0;
+    let (usd, is_max_pct) = if pct >= 99.0 {
+        // Reserve 10% (minimum $0.50) buffer for exchange taker fees, book spread, and 1% trading bound
+        let safe = if bal.available_margin > 1.0 {
+            (bal.available_margin - 0.50).min(bal.available_margin * 0.90)
+        } else {
+            bal.available_margin * 0.80
+        };
+        (((safe * 100.0).floor()) / 100.0, true)
+    } else {
+        (((bal.available_margin * (pct / 100.0) * 100.0).floor()) / 100.0, false)
+    };
     if usd <= 0.0 {
         bot.send_message(
             chat_id,
@@ -1580,11 +1590,19 @@ async fn handle_order_size_percentage(
     pending.step = TradeStep::AwaitingLeverage { usd_amount: usd };
     state.set_session(chat_id, pending).await;
 
-    let prompt_text = format!(
-        "Selected: *${usd:.2}* ({pct:.0}% of available ${:.2})\n\n\
-         What leverage? (Up to *{max_lev:.0}x* — choose or type):",
-        bal.available_margin
-    );
+    let prompt_text = if is_max_pct {
+        format!(
+            "Selected: *${usd:.2}* (100% max with fee reserve from ${:.2})\n\n\
+             What leverage? (Up to *{max_lev:.0}x* — choose or type):",
+            bal.available_margin
+        )
+    } else {
+        format!(
+            "Selected: *${usd:.2}* ({pct:.0}% of available ${:.2})\n\n\
+             What leverage? (Up to *{max_lev:.0}x* — choose or type):",
+            bal.available_margin
+        )
+    };
     bot.send_message(chat_id, prompt_text)
         .reply_markup(leverage_keyboard(Some(max_lev)))
         .parse_mode(ParseMode::Markdown)
@@ -1861,7 +1879,7 @@ async fn handle_trade_step(
         TradeStep::AwaitingUsdAmount => {
             let trimmed = text.trim();
             let is_percentage = trimmed.contains('%');
-            let usd = if is_percentage {
+            let (usd, is_max_pct) = if is_percentage {
                 let cleaned = trimmed.replace('%', "");
                 let pct = match cleaned.trim().parse::<f64>() {
                     Ok(v) if v > 0.0 && v <= 100.0 => v,
@@ -1902,7 +1920,17 @@ async fn handle_trade_step(
                     return Ok(());
                 }
 
-                let calc_usd = ((bal.available_margin * (pct / 100.0) * 100.0).floor()) / 100.0;
+                let (calc_usd, is_max) = if pct >= 99.0 {
+                    let safe = if bal.available_margin > 1.0 {
+                        (bal.available_margin - 0.50).min(bal.available_margin * 0.90)
+                    } else {
+                        bal.available_margin * 0.80
+                    };
+                    ((((safe * 100.0).floor()) / 100.0).max(0.0), true)
+                } else {
+                    (((bal.available_margin * (pct / 100.0) * 100.0).floor()) / 100.0, false)
+                };
+
                 if calc_usd <= 0.0 {
                     bot.send_message(
                         chat_id,
@@ -1912,10 +1940,10 @@ async fn handle_trade_step(
                     .await?;
                     return Ok(());
                 }
-                calc_usd
+                (calc_usd, is_max)
             } else {
                 let cleaned = trimmed.replace('$', "").replace(',', "");
-                match cleaned.parse::<f64>() {
+                let val = match cleaned.parse::<f64>() {
                     Ok(v) if v > 0.0 => v,
                     _ => {
                         bot.send_message(
@@ -1926,6 +1954,41 @@ async fn handle_trade_step(
                         .await?;
                         return Ok(());
                     }
+                };
+
+                let user_opt = state.users.get_user(user_id).await;
+                let bal_opt = if let Some(ref u) = user_opt {
+                    state.trading.get_user_balance(&u.account_id, u.indexer_account_id.as_deref()).await.ok()
+                } else {
+                    None
+                };
+
+                if let Some(bal) = bal_opt {
+                    let safe = if bal.available_margin > 1.0 {
+                        (bal.available_margin - 0.50).min(bal.available_margin * 0.90)
+                    } else {
+                        bal.available_margin * 0.80
+                    };
+                    let max_safe = (((safe * 100.0).floor()) / 100.0).max(0.0);
+                    if val > bal.available_margin {
+                        bot.send_message(
+                            chat_id,
+                            format!(
+                                "❌ Amount *${val:.2}* exceeds your available margin (*${:.2}*). Please enter an amount up to *${max_safe:.2}*:",
+                                bal.available_margin
+                            ),
+                        )
+                        .reply_markup(order_size_keyboard(None))
+                        .parse_mode(ParseMode::Markdown)
+                        .await?;
+                        return Ok(());
+                    } else if val > max_safe {
+                        (max_safe, true)
+                    } else {
+                        (val, false)
+                    }
+                } else {
+                    (val, false)
                 }
             };
 
@@ -1933,7 +1996,11 @@ async fn handle_trade_step(
             pending.step = TradeStep::AwaitingLeverage { usd_amount: usd };
             state.set_session(chat_id, pending).await;
 
-            let prompt_text = format!("Selected: *${usd:.2}*\n\nWhat leverage? (Up to *{max_lev:.0}x* — choose or type):");
+            let prompt_text = if is_max_pct {
+                format!("Selected: *${usd:.2}* (Max available with fee reserve)\n\nWhat leverage? (Up to *{max_lev:.0}x* — choose or type):")
+            } else {
+                format!("Selected: *${usd:.2}*\n\nWhat leverage? (Up to *{max_lev:.0}x* — choose or type):")
+            };
             bot.send_message(chat_id, prompt_text)
                 .reply_markup(leverage_keyboard(Some(max_lev)))
                 .parse_mode(ParseMode::Markdown)
@@ -2237,12 +2304,20 @@ async fn execute_conversational_trade(
         }
     }
 
-    let exec_price = limit_price.unwrap_or(mark_price);
+    let is_market_buy = matches!(order_type, crate::bot::state::OrderTypeChoice::Market)
+        && matches!(direction, TradeDirection::Long);
+    let exec_price = if let Some(p) = limit_price {
+        p
+    } else if is_market_buy {
+        mark_price * 1.01
+    } else {
+        mark_price
+    };
     let total_notional = usd_amount * leverage;
     let raw_qty = total_notional / exec_price;
 
     let decimals = crate::trading::get_cached_market_decimals(market_id);
-    let (qty_str, rounded_qty) = crate::trading::round_qty_to_decimals(raw_qty, decimals);
+    let (qty_str, rounded_qty) = crate::trading::floor_qty_to_decimals(raw_qty, decimals);
 
     if rounded_qty <= 0.0 {
         bot.send_message(
