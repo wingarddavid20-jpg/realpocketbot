@@ -7,7 +7,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use sdk::{
@@ -439,6 +439,159 @@ pub fn floor_qty_to_decimals(qty: f64, decimals: usize) -> (String, f64) {
     (formatted, floored)
 }
 
+/// Floor a price to the market's price increment.
+pub fn floor_price_to_decimals(price: f64, decimals: usize) -> (String, f64) {
+    let factor = 10_f64.powi(decimals as i32);
+    let floored = (price * factor).floor() / factor;
+    let formatted = format!("{:.prec$}", floored, prec = decimals);
+    (formatted, floored)
+}
+
+/// Ceil a price to the market's price increment.
+pub fn ceil_price_to_decimals(price: f64, decimals: usize) -> (String, f64) {
+    let factor = 10_f64.powi(decimals as i32);
+    let ceiled = (price * factor).ceil() / factor;
+    let formatted = format!("{:.prec$}", ceiled, prec = decimals);
+    (formatted, ceiled)
+}
+
+/// Stay inside Real.xyz's 1% trading bound (`trading_bound = 0.01` on every listed perp).
+/// A cap of 1.5% is rejected with PriceBoundStopped, so the order price uses 0.9%.
+const MARKET_PROTECTIVE_OFFSET: f64 = 0.009;
+
+/// Protective IOC price for a marketable order.
+///
+/// A buy (market long, or buying to close a short) is capped *above* the mark.
+/// A sell (market short, or selling to close a long) is floored *below* the mark.
+/// Rounding is toward the mark, then nudged one tick if that lands on the wrong side.
+pub fn protective_slippage_price(mark: f64, is_buy: bool, price_decimals: usize) -> (String, f64) {
+    if !(mark > 0.0) {
+        return ("0".to_string(), 0.0);
+    }
+    let raw = if is_buy {
+        mark * (1.0 + MARKET_PROTECTIVE_OFFSET)
+    } else {
+        mark * (1.0 - MARKET_PROTECTIVE_OFFSET)
+    };
+    let (mut formatted, mut value) = if is_buy {
+        floor_price_to_decimals(raw, price_decimals)
+    } else {
+        ceil_price_to_decimals(raw, price_decimals)
+    };
+    if value <= 0.0 {
+        return (formatted, value);
+    }
+    let step = 10_f64.powi(-(price_decimals as i32));
+    if is_buy && value <= mark {
+        let bumped = value + step;
+        if bumped < mark * 1.01 {
+            value = bumped;
+            formatted = format!("{:.prec$}", value, prec = price_decimals);
+        }
+    } else if !is_buy && value >= mark {
+        let dropped = value - step;
+        if dropped > 0.0 {
+            value = dropped;
+            formatted = format!("{:.prec$}", value, prec = price_decimals);
+        }
+    }
+    (formatted, value)
+}
+
+/// USD margin to commit for a percentage of *spendable* margin.
+///
+/// 100% keeps a 10% buffer, and at least $0.50 when spendable margin is above $1,
+/// so taker fees and the trading-bound slippage check still fit in what is free.
+/// Returns `(usd, is_max)`.
+pub fn margin_budget_for_percentage(spendable: f64, pct: f64) -> (f64, bool) {
+    if !(spendable > 0.0) {
+        return (0.0, pct >= 99.0);
+    }
+    if pct >= 99.0 {
+        let safe = if spendable > 1.0 {
+            (spendable - 0.50).min(spendable * 0.90)
+        } else {
+            spendable * 0.80
+        };
+        (((safe.max(0.0) * 100.0).floor()) / 100.0, true)
+    } else {
+        (((spendable * (pct / 100.0) * 100.0).floor()) / 100.0, false)
+    }
+}
+
+/// Largest USD margin a manual amount may use: the 100% budget, buffer included.
+pub fn max_margin_budget(spendable: f64) -> f64 {
+    margin_budget_for_percentage(spendable, 100.0).0
+}
+
+/// Reduce-only close quantity that never exceeds `position_size`.
+///
+/// `round_qty_to_decimals` rounds half away from zero, so a 100% close of a size
+/// that is not an exact lot (for example 0.00325 at 4 decimals → 0.0033) is
+/// larger than the position and the engine rejects it with
+/// ReduceOnlyOrderExceedsPosition. Flooring leaves at most one lot of dust.
+pub fn format_close_qty(position_size: f64, pct: f64, decimals: usize) -> Option<(String, f64)> {
+    if !(position_size > 0.0) {
+        return None;
+    }
+    let target = if pct >= 99.9 {
+        position_size
+    } else {
+        position_size * (pct / 100.0).clamp(0.0, 1.0)
+    };
+    let (formatted, floored) = floor_qty_to_decimals(target.max(0.0), decimals);
+    if floored > 0.0 && floored <= position_size + 1e-12 {
+        return Some((formatted, floored.min(position_size)));
+    }
+    if decimals > 0 && floored > position_size {
+        let step = 10_f64.powi(-(decimals as i32));
+        let stepped = (floored - step).max(0.0);
+        let (formatted, floored) = floor_qty_to_decimals(stepped, decimals);
+        if floored > 0.0 && floored <= position_size + 1e-12 {
+            return Some((formatted, floored));
+        }
+    }
+    None
+}
+
+/// One lot below `qty`, used when a reduce-only close is still larger than the position.
+pub fn step_down_qty(qty: &str, decimals: usize) -> Option<(String, f64)> {
+    let val = qty.parse::<f64>().ok()?;
+    if decimals > 18 {
+        return None;
+    }
+    let step = 10_f64.powi(-(decimals as i32));
+    let next = val - step;
+    if next <= 0.0 {
+        return None;
+    }
+    let (formatted, floored) = floor_qty_to_decimals(next, decimals);
+    if floored <= 0.0 || formatted == qty {
+        return None;
+    }
+    Some((formatted, floored))
+}
+
+/// True when the engine rejected a reduce-only order for being larger than the position.
+pub fn is_reduce_only_exceeds_position(err_str: &str) -> bool {
+    let lower = err_str.to_lowercase();
+    lower.contains("reduceonlyorderexceedsposition")
+        || lower.contains("reduce only order exceeds")
+        || lower.contains("exceeds position")
+        || lower.contains("exceeds the position")
+        || (lower.contains("reduceonly") && lower.contains("exceed"))
+        || (lower.contains("reduce only") && lower.contains("exceed"))
+}
+
+/// True when the order price was outside the market trading bound.
+pub fn is_price_bound_error(err_str: &str) -> bool {
+    let lower = err_str.to_lowercase();
+    lower.contains("priceboundstopped")
+        || lower.contains("price bound")
+        || lower.contains("trading bound")
+        || lower.contains("outside the bound")
+}
+
 /// Floor and format a string quantity according to a market's allowed decimals.
 pub fn sanitize_order_quantity_for_market(market: &str, qty: &str) -> (String, usize, f64) {
     let decimals = get_cached_market_decimals(market);
@@ -717,7 +870,56 @@ pub struct AccountLookup {
 #[derive(Debug, Clone, Default)]
 pub struct BalanceInfo {
     pub total_equity: f64,
+    /// Indexer `available_balance`. On a current indexer this already excludes
+    /// margin locked in positions and resting orders. Older or partial payloads
+    /// have been seen to leave order margin inside this number.
     pub available_margin: f64,
+    /// Margin reserved by resting orders (`margin_allocated_orders`).
+    pub margin_allocated_orders: f64,
+    /// Margin reserved by open positions (cross + isolated).
+    pub margin_allocated_positions: f64,
+}
+
+impl BalanceInfo {
+    /// Margin that can collateralize a new order.
+    ///
+    /// Takes the smaller of the indexer's available balance and
+    /// `equity - position margin - order margin`. When `available_balance`
+    /// already excludes locked margin the two sides match. When it still
+    /// includes a resting order's margin (the 100% BTC case that sized off
+    /// ~$7.56 while $3 was locked), the equity identity is the smaller number
+    /// and that is what 100% sizes against.
+    pub fn spendable_margin(&self) -> f64 {
+        let locked = (self.margin_allocated_orders + self.margin_allocated_positions).max(0.0);
+        let derived = self.total_equity - locked;
+        if self.available_margin > 0.0 && derived > 0.0 {
+            self.available_margin.min(derived)
+        } else if derived > 0.0 {
+            derived
+        } else {
+            self.available_margin.max(0.0)
+        }
+    }
+}
+
+fn json_f64(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| value.as_f64())
+        .or_else(|| value.as_i64().map(|n| n as f64))
+        .or_else(|| value.as_u64().map(|n| n as f64))
+}
+
+fn json_field_f64(data: &serde_json::Value, keys: &[&str]) -> f64 {
+    for key in keys {
+        if let Some(value) = data.get(*key) {
+            if let Some(n) = json_f64(value) {
+                return n;
+            }
+        }
+    }
+    0.0
 }
 
 /// Aggregated trading volume broken down by asset.
@@ -819,6 +1021,32 @@ pub fn derive_address_from_key(key: &str) -> BotResult<String> {
     RawSigner::new(key)
         .map(|s| s.address())
         .map_err(|e| BotError::Trading(format!("Invalid private key: {e}")))
+}
+
+fn log_order_outcome(res: &OrderResult) {
+    if res.success {
+        info!(
+            market = %res.market,
+            side = %res.side,
+            quantity = %res.quantity,
+            price = %res.price,
+            client_order_id = %res.client_order_id,
+            order_id = ?res.order_id,
+            fills = res.fills.len(),
+            "order result: success"
+        );
+    } else {
+        error!(
+            market = %res.market,
+            side = %res.side,
+            quantity = %res.quantity,
+            price = %res.price,
+            client_order_id = %res.client_order_id,
+            order_id = ?res.order_id,
+            error = ?res.error_msg,
+            "order result: failed"
+        );
+    }
 }
 
 // ─── TradingClient ────────────────────────────────────────────────────────────
@@ -1393,22 +1621,29 @@ impl TradingClient {
             .map_err(|e| BotError::Trading(format!("Failed to parse balance: {e}")))?;
 
         let data = val.get("data").unwrap_or(&val);
-        let total_equity = data
-            .get("equity")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.0);
+        // Full names plus the indexer's compact aliases (`e`, `ab`, `mao`, `macc`, `maic`).
+        let total_equity = json_field_f64(data, &["equity", "e"]);
+        let available_margin = json_field_f64(data, &["available_balance", "ab"]);
+        let margin_allocated_orders = json_field_f64(data, &["margin_allocated_orders", "mao"]);
+        let margin_cross = json_field_f64(data, &["margin_allocated_cross_contracts", "macc"]);
+        let margin_isolated = json_field_f64(data, &["margin_allocated_isolated_contracts", "maic"]);
 
-        let available_margin = data
-            .get("available_balance")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.0);
-
-        Ok(BalanceInfo {
+        let balance = BalanceInfo {
             total_equity,
             available_margin,
-        })
+            margin_allocated_orders,
+            margin_allocated_positions: margin_cross + margin_isolated,
+        };
+        info!(
+            account_id = %indexer_id,
+            equity = balance.total_equity,
+            available_balance = balance.available_margin,
+            margin_allocated_orders = balance.margin_allocated_orders,
+            margin_allocated_positions = balance.margin_allocated_positions,
+            spendable = balance.spendable_margin(),
+            "account margin snapshot"
+        );
+        Ok(balance)
     }
 
     /// Query default account balance.
@@ -2170,57 +2405,233 @@ impl TradingClient {
         }
     }
 
-    /// Place a market buy (long) order with immediate-or-cancel execution.
-    pub async fn place_market_long(
+    /// Protective IOC price for a marketable order, on the correct side of the mark.
+    /// Buy: above the mark. Sell: below the mark. `None` if the mark cannot be read;
+    /// the caller then sends an unbounded market order.
+    async fn market_protective_price(&self, market: &str, is_buy: bool) -> Option<String> {
+        match self.get_market_mark_price(market).await {
+            Ok(mark) if mark > 0.0 => {
+                let decimals = get_cached_market_price_decimals(market);
+                let (price, value) = protective_slippage_price(mark, is_buy, decimals);
+                if value > 0.0 {
+                    info!(
+                        market,
+                        is_buy,
+                        mark,
+                        protective = %price,
+                        "computed market protective price"
+                    );
+                    Some(price)
+                } else {
+                    None
+                }
+            }
+            Ok(_) => None,
+            Err(e) => {
+                warn!(
+                    market,
+                    error = %e,
+                    "mark unavailable; market order will not carry a protective price"
+                );
+                None
+            }
+        }
+    }
+
+    async fn submit_parsed(
         &self,
+        client: &SigningClient,
+        order: SubmitOrderRequest,
+        side: &str,
+        quantity: &str,
+        price: &str,
+        market: &str,
+        client_order_id: &str,
+    ) -> BotResult<OrderResult> {
+        let req_id = Uuid::new_v4().to_string();
+        let report = match client.submit_order(order, Some(req_id)).await {
+            Ok(report) => report,
+            Err(e) => {
+                error!(
+                    market,
+                    side,
+                    quantity,
+                    price,
+                    client_order_id,
+                    error = %e,
+                    "order submit failed"
+                );
+                return Err(BotError::Trading(format!("submit_order: {e}")));
+            }
+        };
+        self.parse_order_result(report, side, quantity, price, market, client_order_id)
+    }
+
+    fn build_marketable_order(
+        market: &str,
+        account_id: &str,
+        is_buy: bool,
+        qty: &str,
+        protective: Option<&str>,
+        coid: &str,
+    ) -> BotResult<SubmitOrderRequest> {
+        let mut builder = SubmitOrderRequest::builder();
+        builder = builder.market(market).account(account_id);
+        builder = if is_buy { builder.buy() } else { builder.sell() };
+        // IOC limit at the side-correct cap. A naked market order cannot carry a
+        // price (the SDK rejects one), so the protective price is a marketable limit.
+        builder = match protective {
+            Some(price) => builder.limit_order(price),
+            None => builder.market_order(),
+        };
+        builder
+            .quantity(qty)
+            .immediate_or_cancel()
+            .client_order_id(coid)
+            .build()
+            .map_err(|e| BotError::Trading(format!("Build market order: {e}")))
+    }
+
+    /// Shared by `place_market_long` / `place_market_short` and the per-user twins.
+    /// Same protective price, same Error 114 / 121 retries, same 0.90 then 0.80
+    /// InsufficientMargin reductions.
+    async fn place_marketable_order(
+        &self,
+        client: &SigningClient,
+        account_id: &str,
         market: &str,
         quantity: &str,
+        is_buy: bool,
+        mut protective: Option<String>,
     ) -> BotResult<OrderResult> {
         let (clean_qty, decimals, _) = sanitize_order_quantity_for_market(market, quantity);
+        let price_decimals = get_cached_market_price_decimals(market);
+        let side = if is_buy { "Buy (Market)" } else { "Sell (Market)" };
+        let price_label = protective.clone().unwrap_or_else(|| "Market".to_string());
+
+        info!(
+            market,
+            side,
+            quantity = %clean_qty,
+            protective = %price_label,
+            "placing market order"
+        );
+
         let coid = Uuid::new_v4().to_string();
-        let account_id = self.get_effective_account_id().await;
-        let order = SubmitOrderRequest::builder()
-            .market(market)
-            .account(&account_id)
-            .buy()
-            .market_order()
-            .quantity(&clean_qty)
-            .immediate_or_cancel()
-            .client_order_id(&coid)
-            .build()
-            .map_err(|e| BotError::Trading(format!("Build market long order: {e}")))?;
+        let order = Self::build_marketable_order(
+            market,
+            account_id,
+            is_buy,
+            &clean_qty,
+            protective.as_deref(),
+            &coid,
+        )?;
+        let mut res = self
+            .submit_parsed(client, order, side, &clean_qty, &price_label, market, &coid)
+            .await?;
 
-        let req_id = Uuid::new_v4().to_string();
-        let client = self.client.lock().await;
-        let report = client
-            .submit_order(order, Some(req_id))
-            .await
-            .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
-        drop(client);
-
-        let mut res = self.parse_order_result(report, "Buy (Market)", &clean_qty, "Market", market, &coid)?;
-
-        if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
-            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
-                info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying market buy with 1 fewer decimal place");
+        if !res.success
+            && protective.is_some()
+            && res.error_msg.as_deref().map_or(false, is_price_decimal_error)
+        {
+            let current = protective.as_deref().unwrap();
+            if let Some((retry_price, new_dec)) =
+                next_fewer_decimal_price(market, current, price_decimals)
+            {
+                info!(
+                    market,
+                    old_price_decimals = price_decimals,
+                    new_price_decimals = new_dec,
+                    retry_price = %retry_price,
+                    "Retrying market order after Error 114"
+                );
+                protective = Some(retry_price.clone());
                 let retry_coid = Uuid::new_v4().to_string();
-                if let Ok(retry_order) = SubmitOrderRequest::builder()
-                    .market(market)
-                    .account(&account_id)
-                    .buy()
-                    .market_order()
-                    .quantity(&retry_qty)
-                    .immediate_or_cancel()
-                    .client_order_id(&retry_coid)
-                    .build()
-                {
-                    let retry_req = Uuid::new_v4().to_string();
-                    let client = self.client.lock().await;
-                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
-                        drop(client);
-                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy (Market)", &retry_qty, "Market", market, &retry_coid) {
-                            res = retry_res;
-                        }
+                if let Ok(retry_order) = Self::build_marketable_order(
+                    market,
+                    account_id,
+                    is_buy,
+                    &clean_qty,
+                    Some(&retry_price),
+                    &retry_coid,
+                ) {
+                    if let Ok(retry_res) = self
+                        .submit_parsed(
+                            client,
+                            retry_order,
+                            side,
+                            &clean_qty,
+                            &retry_price,
+                            market,
+                            &retry_coid,
+                        )
+                        .await
+                    {
+                        res = retry_res;
+                    }
+                }
+            }
+        } else if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error)
+        {
+            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals)
+            {
+                info!(
+                    market,
+                    old_decimals = decimals,
+                    new_decimals = new_dec,
+                    retry_qty = %retry_qty,
+                    "Retrying market order after Error 121"
+                );
+                let retry_label = protective.clone().unwrap_or_else(|| "Market".to_string());
+                let retry_coid = Uuid::new_v4().to_string();
+                if let Ok(retry_order) = Self::build_marketable_order(
+                    market,
+                    account_id,
+                    is_buy,
+                    &retry_qty,
+                    protective.as_deref(),
+                    &retry_coid,
+                ) {
+                    if let Ok(retry_res) = self
+                        .submit_parsed(
+                            client,
+                            retry_order,
+                            side,
+                            &retry_qty,
+                            &retry_label,
+                            market,
+                            &retry_coid,
+                        )
+                        .await
+                    {
+                        res = retry_res;
+                    }
+                }
+            }
+        }
+
+        if !res.success && res.error_msg.as_deref().map_or(false, is_price_bound_error) {
+            if let Some(fresh) = self.market_protective_price(market, is_buy).await {
+                info!(
+                    market,
+                    retry_price = %fresh,
+                    "Retrying market order after price-bound rejection"
+                );
+                protective = Some(fresh.clone());
+                let retry_coid = Uuid::new_v4().to_string();
+                if let Ok(retry_order) = Self::build_marketable_order(
+                    market,
+                    account_id,
+                    is_buy,
+                    &clean_qty,
+                    Some(&fresh),
+                    &retry_coid,
+                ) {
+                    if let Ok(retry_res) = self
+                        .submit_parsed(client, retry_order, side, &clean_qty, &fresh, market, &retry_coid)
+                        .await
+                    {
+                        res = retry_res;
                     }
                 }
             }
@@ -2228,31 +2639,42 @@ impl TradingClient {
 
         if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
             if let Ok(val) = clean_qty.parse::<f64>() {
-                for reduction in [0.90, 0.80] {
+                for reduction in [0.90_f64, 0.80] {
                     let reduced_val = val * reduction;
                     let (retry_qty, floored) = floor_qty_to_decimals(reduced_val, decimals);
                     if floored > 0.0 && retry_qty != clean_qty {
-                        info!(market = %market, old_qty = %clean_qty, retry_qty = %retry_qty, reduction = %reduction, "Retrying market buy after InsufficientMargin");
+                        info!(
+                            market,
+                            old_qty = %clean_qty,
+                            retry_qty = %retry_qty,
+                            reduction,
+                            "Retrying market order after InsufficientMargin"
+                        );
+                        let retry_label = protective.clone().unwrap_or_else(|| "Market".to_string());
                         let retry_coid = Uuid::new_v4().to_string();
-                        if let Ok(retry_order) = SubmitOrderRequest::builder()
-                            .market(market)
-                            .account(&account_id)
-                            .buy()
-                            .market_order()
-                            .quantity(&retry_qty)
-                            .immediate_or_cancel()
-                            .client_order_id(&retry_coid)
-                            .build()
-                        {
-                            let retry_req = Uuid::new_v4().to_string();
-                            let client = self.client.lock().await;
-                            if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
-                                drop(client);
-                                if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy (Market)", &retry_qty, "Market", market, &retry_coid) {
-                                    res = retry_res;
-                                    if res.success {
-                                        break;
-                                    }
+                        if let Ok(retry_order) = Self::build_marketable_order(
+                            market,
+                            account_id,
+                            is_buy,
+                            &retry_qty,
+                            protective.as_deref(),
+                            &retry_coid,
+                        ) {
+                            if let Ok(retry_res) = self
+                                .submit_parsed(
+                                    client,
+                                    retry_order,
+                                    side,
+                                    &retry_qty,
+                                    &retry_label,
+                                    market,
+                                    &retry_coid,
+                                )
+                                .await
+                            {
+                                res = retry_res;
+                                if res.success {
+                                    break;
                                 }
                             }
                         }
@@ -2264,103 +2686,39 @@ impl TradingClient {
         Ok(res)
     }
 
-    /// Place a market sell (short) order with immediate-or-cancel execution.
-    pub async fn place_market_short(
-        &self,
+    fn build_reduce_only_order(
         market: &str,
-        quantity: &str,
-    ) -> BotResult<OrderResult> {
-        let (clean_qty, decimals, _) = sanitize_order_quantity_for_market(market, quantity);
-        let coid = Uuid::new_v4().to_string();
-        let account_id = self.get_effective_account_id().await;
-        let order = SubmitOrderRequest::builder()
-            .market(market)
-            .account(&account_id)
-            .sell()
-            .market_order()
-            .quantity(&clean_qty)
-            .immediate_or_cancel()
-            .client_order_id(&coid)
+        account_id: &str,
+        side: &str,
+        qty: &str,
+        price: Option<&str>,
+        coid: &str,
+    ) -> BotResult<SubmitOrderRequest> {
+        let mut builder = SubmitOrderRequest::builder();
+        builder = builder.market(market).account(account_id);
+        builder = if side.eq_ignore_ascii_case("buy") {
+            builder.buy()
+        } else {
+            builder.sell()
+        };
+        builder = if let Some(p) = price {
+            builder.limit_order(p).good_till_cancel()
+        } else {
+            builder.market_order().immediate_or_cancel()
+        };
+        builder
+            .quantity(qty)
+            .reduce_only(true)
+            .client_order_id(coid)
             .build()
-            .map_err(|e| BotError::Trading(format!("Build market short order: {e}")))?;
-
-        let req_id = Uuid::new_v4().to_string();
-        let client = self.client.lock().await;
-        let report = client
-            .submit_order(order, Some(req_id))
-            .await
-            .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
-        drop(client);
-
-        let mut res = self.parse_order_result(report, "Sell (Market)", &clean_qty, "Market", market, &coid)?;
-
-        if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
-            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
-                info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying market sell with 1 fewer decimal place");
-                let retry_coid = Uuid::new_v4().to_string();
-                if let Ok(retry_order) = SubmitOrderRequest::builder()
-                    .market(market)
-                    .account(&account_id)
-                    .sell()
-                    .market_order()
-                    .quantity(&retry_qty)
-                    .immediate_or_cancel()
-                    .client_order_id(&retry_coid)
-                    .build()
-                {
-                    let retry_req = Uuid::new_v4().to_string();
-                    let client = self.client.lock().await;
-                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
-                        drop(client);
-                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell (Market)", &retry_qty, "Market", market, &retry_coid) {
-                            res = retry_res;
-                        }
-                    }
-                }
-            }
-        }
-
-        if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
-            if let Ok(val) = clean_qty.parse::<f64>() {
-                for reduction in [0.90, 0.80] {
-                    let reduced_val = val * reduction;
-                    let (retry_qty, floored) = floor_qty_to_decimals(reduced_val, decimals);
-                    if floored > 0.0 && retry_qty != clean_qty {
-                        info!(market = %market, old_qty = %clean_qty, retry_qty = %retry_qty, reduction = %reduction, "Retrying market sell after InsufficientMargin");
-                        let retry_coid = Uuid::new_v4().to_string();
-                        if let Ok(retry_order) = SubmitOrderRequest::builder()
-                            .market(market)
-                            .account(&account_id)
-                            .sell()
-                            .market_order()
-                            .quantity(&retry_qty)
-                            .immediate_or_cancel()
-                            .client_order_id(&retry_coid)
-                            .build()
-                        {
-                            let retry_req = Uuid::new_v4().to_string();
-                            let client = self.client.lock().await;
-                            if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
-                                drop(client);
-                                if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell (Market)", &retry_qty, "Market", market, &retry_coid) {
-                                    res = retry_res;
-                                    if res.success {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(res)
+            .map_err(|e| BotError::Trading(format!("Build close order: {e}")))
     }
 
-    /// Place a reduce-only order to close an open position (market or limit).
-    pub async fn place_close_order(
+    /// Shared by `place_close_order` and `place_user_close_order`.
+    async fn place_reduce_only_order(
         &self,
+        client: &SigningClient,
+        account_id: &str,
         market: &str,
         side: &str,
         quantity: &str,
@@ -2374,105 +2732,207 @@ impl TradingClient {
             }
             None => (None, 0),
         };
+        let price_label = clean_price_opt.clone().unwrap_or_else(|| "Market".to_string());
+        info!(
+            market,
+            side,
+            quantity = %clean_qty,
+            price = %price_label,
+            "placing close order"
+        );
+
         let coid = Uuid::new_v4().to_string();
-        let account_id = self.get_effective_account_id().await;
-        let mut builder = SubmitOrderRequest::builder();
-        builder = builder.market(market).account(&account_id);
+        let order = Self::build_reduce_only_order(
+            market,
+            account_id,
+            side,
+            &clean_qty,
+            clean_price_opt.as_deref(),
+            &coid,
+        )?;
+        let mut res = self
+            .submit_parsed(client, order, side, &clean_qty, &price_label, market, &coid)
+            .await?;
 
-        if side.eq_ignore_ascii_case("buy") {
-            builder = builder.buy();
-        } else {
-            builder = builder.sell();
-        }
-
-        if let Some(ref p) = clean_price_opt {
-            builder = builder.limit_order(p).good_till_cancel();
-        } else {
-            builder = builder.market_order().immediate_or_cancel();
-        }
-
-        let order = builder
-            .quantity(&clean_qty)
-            .reduce_only(true)
-            .client_order_id(&coid)
-            .build()
-            .map_err(|e| BotError::Trading(format!("Build close order: {e}")))?;
-
-        let req_id = Uuid::new_v4().to_string();
-        let client = self.client.lock().await;
-        let report = client
-            .submit_order(order, Some(req_id))
-            .await
-            .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
-        drop(client);
-
-        let price_label = clean_price_opt.as_deref().unwrap_or("Market");
-        let mut res = self.parse_order_result(report, side, &clean_qty, price_label, market, &coid)?;
-
-        if !res.success && clean_price_opt.is_some() && res.error_msg.as_deref().map_or(false, is_price_decimal_error) {
-            let cur_p = clean_price_opt.as_deref().unwrap();
-            if let Some((retry_price, new_p_dec)) = next_fewer_decimal_price(market, cur_p, price_decimals) {
-                info!(market = %market, old_price_decimals = price_decimals, new_price_decimals = new_p_dec, retry_price = %retry_price, "Retrying close order with 1 fewer price decimal place");
+        if !res.success
+            && clean_price_opt.is_some()
+            && res.error_msg.as_deref().map_or(false, is_price_decimal_error)
+        {
+            let current = clean_price_opt.as_deref().unwrap();
+            if let Some((retry_price, new_dec)) =
+                next_fewer_decimal_price(market, current, price_decimals)
+            {
+                info!(
+                    market,
+                    old_price_decimals = price_decimals,
+                    new_price_decimals = new_dec,
+                    retry_price = %retry_price,
+                    "Retrying close order after Error 114"
+                );
                 let retry_coid = Uuid::new_v4().to_string();
-                let mut retry_builder = SubmitOrderRequest::builder();
-                retry_builder = retry_builder.market(market).account(&account_id);
-                if side.eq_ignore_ascii_case("buy") {
-                    retry_builder = retry_builder.buy();
-                } else {
-                    retry_builder = retry_builder.sell();
-                }
-                retry_builder = retry_builder.limit_order(&retry_price).good_till_cancel();
-                if let Ok(retry_order) = retry_builder
-                    .quantity(&clean_qty)
-                    .reduce_only(true)
-                    .client_order_id(&retry_coid)
-                    .build()
-                {
-                    let retry_req = Uuid::new_v4().to_string();
-                    let client = self.client.lock().await;
-                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
-                        drop(client);
-                        if let Ok(retry_res) = self.parse_order_result(retry_rep, side, &clean_qty, &retry_price, market, &retry_coid) {
-                            res = retry_res;
-                        }
+                if let Ok(retry_order) = Self::build_reduce_only_order(
+                    market,
+                    account_id,
+                    side,
+                    &clean_qty,
+                    Some(&retry_price),
+                    &retry_coid,
+                ) {
+                    if let Ok(retry_res) = self
+                        .submit_parsed(
+                            client,
+                            retry_order,
+                            side,
+                            &clean_qty,
+                            &retry_price,
+                            market,
+                            &retry_coid,
+                        )
+                        .await
+                    {
+                        res = retry_res;
                     }
                 }
             }
-        } else if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
-            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
-                info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying close order with 1 fewer decimal place");
+        } else if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error)
+        {
+            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals)
+            {
+                info!(
+                    market,
+                    old_decimals = decimals,
+                    new_decimals = new_dec,
+                    retry_qty = %retry_qty,
+                    "Retrying close order after Error 121"
+                );
                 let retry_coid = Uuid::new_v4().to_string();
-                let mut retry_builder = SubmitOrderRequest::builder();
-                retry_builder = retry_builder.market(market).account(&account_id);
-                if side.eq_ignore_ascii_case("buy") {
-                    retry_builder = retry_builder.buy();
-                } else {
-                    retry_builder = retry_builder.sell();
+                if let Ok(retry_order) = Self::build_reduce_only_order(
+                    market,
+                    account_id,
+                    side,
+                    &retry_qty,
+                    clean_price_opt.as_deref(),
+                    &retry_coid,
+                ) {
+                    if let Ok(retry_res) = self
+                        .submit_parsed(
+                            client,
+                            retry_order,
+                            side,
+                            &retry_qty,
+                            &price_label,
+                            market,
+                            &retry_coid,
+                        )
+                        .await
+                    {
+                        res = retry_res;
+                    }
                 }
-                if let Some(ref p) = clean_price_opt {
-                    retry_builder = retry_builder.limit_order(p).good_till_cancel();
-                } else {
-                    retry_builder = retry_builder.market_order().immediate_or_cancel();
-                }
-                if let Ok(retry_order) = retry_builder
-                    .quantity(&retry_qty)
-                    .reduce_only(true)
-                    .client_order_id(&retry_coid)
-                    .build()
+            }
+        }
+
+        // A close sized with round-half-up can be one lot above the position.
+        // Step down and resubmit instead of leaving ReduceOnlyOrderExceedsPosition unlogged.
+        if !res.success && res.error_msg.as_deref().map_or(false, is_reduce_only_exceeds_position) {
+            let mut current_qty = res.quantity.clone();
+            if current_qty.is_empty() {
+                current_qty = clean_qty.clone();
+            }
+            for _ in 0..3 {
+                let Some((retry_qty, _)) = step_down_qty(&current_qty, decimals) else {
+                    break;
+                };
+                info!(
+                    market,
+                    old_qty = %current_qty,
+                    retry_qty = %retry_qty,
+                    "Retrying close order after ReduceOnlyOrderExceedsPosition"
+                );
+                current_qty = retry_qty.clone();
+                let retry_coid = Uuid::new_v4().to_string();
+                let Ok(retry_order) = Self::build_reduce_only_order(
+                    market,
+                    account_id,
+                    side,
+                    &retry_qty,
+                    clean_price_opt.as_deref(),
+                    &retry_coid,
+                ) else {
+                    break;
+                };
+                match self
+                    .submit_parsed(
+                        client,
+                        retry_order,
+                        side,
+                        &retry_qty,
+                        &price_label,
+                        market,
+                        &retry_coid,
+                    )
+                    .await
                 {
-                    let retry_req = Uuid::new_v4().to_string();
-                    let client = self.client.lock().await;
-                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
-                        drop(client);
-                        if let Ok(retry_res) = self.parse_order_result(retry_rep, side, &retry_qty, price_label, market, &retry_coid) {
-                            res = retry_res;
+                    Ok(retry_res) => {
+                        let still_exceeds = !retry_res.success
+                            && retry_res
+                                .error_msg
+                                .as_deref()
+                                .map_or(false, is_reduce_only_exceeds_position);
+                        res = retry_res;
+                        if res.success || !still_exceeds {
+                            break;
                         }
                     }
+                    Err(_) => break,
                 }
             }
         }
 
         Ok(res)
+    }
+
+    /// Place a market buy (long). Protective IOC price is above the mark.
+    /// Same path as `place_user_market_long` (`place_marketable_order`).
+    pub async fn place_market_long(
+        &self,
+        market: &str,
+        quantity: &str,
+    ) -> BotResult<OrderResult> {
+        let protective = self.market_protective_price(market, true).await;
+        let account_id = self.get_effective_account_id().await;
+        let client = self.client.lock().await;
+        self.place_marketable_order(&client, &account_id, market, quantity, true, protective)
+            .await
+    }
+
+    /// Place a market sell (short). Protective IOC price is below the mark.
+    /// Same path as `place_user_market_short` (`place_marketable_order`).
+    pub async fn place_market_short(
+        &self,
+        market: &str,
+        quantity: &str,
+    ) -> BotResult<OrderResult> {
+        let protective = self.market_protective_price(market, false).await;
+        let account_id = self.get_effective_account_id().await;
+        let client = self.client.lock().await;
+        self.place_marketable_order(&client, &account_id, market, quantity, false, protective)
+            .await
+    }
+
+    /// Place a reduce-only order to close an open position (market or limit).
+    /// Same path as `place_user_close_order` (`place_reduce_only_order`).
+    pub async fn place_close_order(
+        &self,
+        market: &str,
+        side: &str,
+        quantity: &str,
+        price: Option<&str>,
+    ) -> BotResult<OrderResult> {
+        let account_id = self.get_effective_account_id().await;
+        let client = self.client.lock().await;
+        self.place_reduce_only_order(&client, &account_id, market, side, quantity, price)
+            .await
     }
 
     /// Place a limit buy (long) order.
@@ -2523,7 +2983,10 @@ impl TradingClient {
         let report = client
             .submit_order(order, Some(req_id))
             .await
-            .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
+            .map_err(|e| {
+                error!(market = %market, error = %e, "order submit failed");
+                BotError::Trading(format!("submit_order: {e}"))
+            })?;
         drop(client);
 
         let mut res = self.parse_order_result(report, "Buy", &clean_qty, &clean_price, market, &coid)?;
@@ -2558,7 +3021,11 @@ impl TradingClient {
                 {
                     let retry_req = Uuid::new_v4().to_string();
                     let client = self.client.lock().await;
-                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                    let retry_submit = client.submit_order(retry_order, Some(retry_req)).await;
+                    if let Err(ref retry_err) = retry_submit {
+                        error!(market = %market, error = %retry_err, "retry order submit failed");
+                    }
+                    if let Ok(retry_rep) = retry_submit {
                         drop(client);
                         if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy", &clean_qty, &retry_price, market, &retry_coid) {
                             res = retry_res;
@@ -2583,7 +3050,11 @@ impl TradingClient {
                 {
                     let retry_req = Uuid::new_v4().to_string();
                     let client = self.client.lock().await;
-                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                    let retry_submit = client.submit_order(retry_order, Some(retry_req)).await;
+                    if let Err(ref retry_err) = retry_submit {
+                        error!(market = %market, error = %retry_err, "retry order submit failed");
+                    }
+                    if let Ok(retry_rep) = retry_submit {
                         drop(client);
                         if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy", &retry_qty, &clean_price, market, &retry_coid) {
                             res = retry_res;
@@ -2614,7 +3085,11 @@ impl TradingClient {
                         {
                             let retry_req = Uuid::new_v4().to_string();
                             let client = self.client.lock().await;
-                            if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                            let retry_submit = client.submit_order(retry_order, Some(retry_req)).await;
+                            if let Err(ref retry_err) = retry_submit {
+                                error!(market = %market, error = %retry_err, "retry order submit failed");
+                            }
+                            if let Ok(retry_rep) = retry_submit {
                                 drop(client);
                                 if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy", &retry_qty, &clean_price, market, &retry_coid) {
                                     res = retry_res;
@@ -2680,7 +3155,10 @@ impl TradingClient {
         let report = client
             .submit_order(order, Some(req_id))
             .await
-            .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
+            .map_err(|e| {
+                error!(market = %market, error = %e, "order submit failed");
+                BotError::Trading(format!("submit_order: {e}"))
+            })?;
         drop(client);
 
         let mut res = self.parse_order_result(report, "Sell", &clean_qty, &clean_price, market, &coid)?;
@@ -2715,7 +3193,11 @@ impl TradingClient {
                 {
                     let retry_req = Uuid::new_v4().to_string();
                     let client = self.client.lock().await;
-                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                    let retry_submit = client.submit_order(retry_order, Some(retry_req)).await;
+                    if let Err(ref retry_err) = retry_submit {
+                        error!(market = %market, error = %retry_err, "retry order submit failed");
+                    }
+                    if let Ok(retry_rep) = retry_submit {
                         drop(client);
                         if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &clean_qty, &retry_price, market, &retry_coid) {
                             res = retry_res;
@@ -2740,7 +3222,11 @@ impl TradingClient {
                 {
                     let retry_req = Uuid::new_v4().to_string();
                     let client = self.client.lock().await;
-                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                    let retry_submit = client.submit_order(retry_order, Some(retry_req)).await;
+                    if let Err(ref retry_err) = retry_submit {
+                        error!(market = %market, error = %retry_err, "retry order submit failed");
+                    }
+                    if let Ok(retry_rep) = retry_submit {
                         drop(client);
                         if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &retry_qty, &clean_price, market, &retry_coid) {
                             res = retry_res;
@@ -2771,7 +3257,11 @@ impl TradingClient {
                         {
                             let retry_req = Uuid::new_v4().to_string();
                             let client = self.client.lock().await;
-                            if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                            let retry_submit = client.submit_order(retry_order, Some(retry_req)).await;
+                            if let Err(ref retry_err) = retry_submit {
+                                error!(market = %market, error = %retry_err, "retry order submit failed");
+                            }
+                            if let Ok(retry_rep) = retry_submit {
                                 drop(client);
                                 if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &retry_qty, &clean_price, market, &retry_coid) {
                                     res = retry_res;
@@ -2853,87 +3343,15 @@ impl TradingClient {
         decrypted_key: &str,
         market: &str,
         quantity: &str,
+        protective_price: Option<&str>,
     ) -> BotResult<OrderResult> {
-        let (clean_qty, decimals, _) = sanitize_order_quantity_for_market(market, quantity);
-        let coid = Uuid::new_v4().to_string();
-        let order = SubmitOrderRequest::builder()
-            .market(market)
-            .account(account_id)
-            .buy()
-            .market_order()
-            .quantity(&clean_qty)
-            .immediate_or_cancel()
-            .client_order_id(&coid)
-            .build()
-            .map_err(|e| BotError::Trading(format!("Build market long order: {e}")))?;
-
-        let req_id = Uuid::new_v4().to_string();
+        let protective = match protective_price {
+            Some(p) if !p.is_empty() => Some(p.to_string()),
+            _ => self.market_protective_price(market, true).await,
+        };
         let client = self.create_user_signing_client(decrypted_key)?;
-        let report = client
-            .submit_order(order, Some(req_id))
+        self.place_marketable_order(&client, account_id, market, quantity, true, protective)
             .await
-            .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
-
-        let mut res = self.parse_order_result(report, "Buy (Market)", &clean_qty, "Market", market, &coid)?;
-
-        if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
-            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
-                info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying user market buy with 1 fewer decimal place");
-                let retry_coid = Uuid::new_v4().to_string();
-                if let Ok(retry_order) = SubmitOrderRequest::builder()
-                    .market(market)
-                    .account(account_id)
-                    .buy()
-                    .market_order()
-                    .quantity(&retry_qty)
-                    .immediate_or_cancel()
-                    .client_order_id(&retry_coid)
-                    .build()
-                {
-                    let retry_req = Uuid::new_v4().to_string();
-                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
-                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy (Market)", &retry_qty, "Market", market, &retry_coid) {
-                            res = retry_res;
-                        }
-                    }
-                }
-            }
-        }
-
-        if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
-            if let Ok(val) = clean_qty.parse::<f64>() {
-                for reduction in [0.90, 0.80] {
-                    let reduced_val = val * reduction;
-                    let (retry_qty, floored) = floor_qty_to_decimals(reduced_val, decimals);
-                    if floored > 0.0 && retry_qty != clean_qty {
-                        info!(market = %market, old_qty = %clean_qty, retry_qty = %retry_qty, reduction = %reduction, "Retrying user market buy after InsufficientMargin");
-                        let retry_coid = Uuid::new_v4().to_string();
-                        if let Ok(retry_order) = SubmitOrderRequest::builder()
-                            .market(market)
-                            .account(account_id)
-                            .buy()
-                            .market_order()
-                            .quantity(&retry_qty)
-                            .immediate_or_cancel()
-                            .client_order_id(&retry_coid)
-                            .build()
-                        {
-                            let retry_req = Uuid::new_v4().to_string();
-                            if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
-                                if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy (Market)", &retry_qty, "Market", market, &retry_coid) {
-                                    res = retry_res;
-                                    if res.success {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(res)
     }
 
     pub async fn place_user_market_short(
@@ -2942,87 +3360,15 @@ impl TradingClient {
         decrypted_key: &str,
         market: &str,
         quantity: &str,
+        protective_price: Option<&str>,
     ) -> BotResult<OrderResult> {
-        let (clean_qty, decimals, _) = sanitize_order_quantity_for_market(market, quantity);
-        let coid = Uuid::new_v4().to_string();
-        let order = SubmitOrderRequest::builder()
-            .market(market)
-            .account(account_id)
-            .sell()
-            .market_order()
-            .quantity(&clean_qty)
-            .immediate_or_cancel()
-            .client_order_id(&coid)
-            .build()
-            .map_err(|e| BotError::Trading(format!("Build market short order: {e}")))?;
-
-        let req_id = Uuid::new_v4().to_string();
+        let protective = match protective_price {
+            Some(p) if !p.is_empty() => Some(p.to_string()),
+            _ => self.market_protective_price(market, false).await,
+        };
         let client = self.create_user_signing_client(decrypted_key)?;
-        let report = client
-            .submit_order(order, Some(req_id))
+        self.place_marketable_order(&client, account_id, market, quantity, false, protective)
             .await
-            .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
-
-        let mut res = self.parse_order_result(report, "Sell (Market)", &clean_qty, "Market", market, &coid)?;
-
-        if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
-            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
-                info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying user market sell with 1 fewer decimal place");
-                let retry_coid = Uuid::new_v4().to_string();
-                if let Ok(retry_order) = SubmitOrderRequest::builder()
-                    .market(market)
-                    .account(account_id)
-                    .sell()
-                    .market_order()
-                    .quantity(&retry_qty)
-                    .immediate_or_cancel()
-                    .client_order_id(&retry_coid)
-                    .build()
-                {
-                    let retry_req = Uuid::new_v4().to_string();
-                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
-                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell (Market)", &retry_qty, "Market", market, &retry_coid) {
-                            res = retry_res;
-                        }
-                    }
-                }
-            }
-        }
-
-        if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
-            if let Ok(val) = clean_qty.parse::<f64>() {
-                for reduction in [0.90, 0.80] {
-                    let reduced_val = val * reduction;
-                    let (retry_qty, floored) = floor_qty_to_decimals(reduced_val, decimals);
-                    if floored > 0.0 && retry_qty != clean_qty {
-                        info!(market = %market, old_qty = %clean_qty, retry_qty = %retry_qty, reduction = %reduction, "Retrying user market sell after InsufficientMargin");
-                        let retry_coid = Uuid::new_v4().to_string();
-                        if let Ok(retry_order) = SubmitOrderRequest::builder()
-                            .market(market)
-                            .account(account_id)
-                            .sell()
-                            .market_order()
-                            .quantity(&retry_qty)
-                            .immediate_or_cancel()
-                            .client_order_id(&retry_coid)
-                            .build()
-                        {
-                            let retry_req = Uuid::new_v4().to_string();
-                            if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
-                                if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell (Market)", &retry_qty, "Market", market, &retry_coid) {
-                                    res = retry_res;
-                                    if res.success {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(res)
     }
 
     pub async fn place_user_limit_long(
@@ -3074,7 +3420,10 @@ impl TradingClient {
         let report = client
             .submit_order(order, Some(req_id))
             .await
-            .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
+            .map_err(|e| {
+                error!(market = %market, error = %e, "order submit failed");
+                BotError::Trading(format!("submit_order: {e}"))
+            })?;
 
         let mut res = self.parse_order_result(report, "Buy", &clean_qty, &clean_price, market, &coid)?;
 
@@ -3107,7 +3456,11 @@ impl TradingClient {
                     .build()
                 {
                     let retry_req = Uuid::new_v4().to_string();
-                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                    let retry_submit = client.submit_order(retry_order, Some(retry_req)).await;
+                    if let Err(ref retry_err) = retry_submit {
+                        error!(market = %market, error = %retry_err, "retry order submit failed");
+                    }
+                    if let Ok(retry_rep) = retry_submit {
                         if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy", &clean_qty, &retry_price, market, &retry_coid) {
                             res = retry_res;
                         }
@@ -3130,7 +3483,11 @@ impl TradingClient {
                     .build()
                 {
                     let retry_req = Uuid::new_v4().to_string();
-                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                    let retry_submit = client.submit_order(retry_order, Some(retry_req)).await;
+                    if let Err(ref retry_err) = retry_submit {
+                        error!(market = %market, error = %retry_err, "retry order submit failed");
+                    }
+                    if let Ok(retry_rep) = retry_submit {
                         if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy", &retry_qty, &clean_price, market, &retry_coid) {
                             res = retry_res;
                         }
@@ -3159,7 +3516,11 @@ impl TradingClient {
                             .build()
                         {
                             let retry_req = Uuid::new_v4().to_string();
-                            if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                            let retry_submit = client.submit_order(retry_order, Some(retry_req)).await;
+                            if let Err(ref retry_err) = retry_submit {
+                                error!(market = %market, error = %retry_err, "retry order submit failed");
+                            }
+                            if let Ok(retry_rep) = retry_submit {
                                 if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy", &retry_qty, &clean_price, market, &retry_coid) {
                                     res = retry_res;
                                     if res.success {
@@ -3225,7 +3586,10 @@ impl TradingClient {
         let report = client
             .submit_order(order, Some(req_id))
             .await
-            .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
+            .map_err(|e| {
+                error!(market = %market, error = %e, "order submit failed");
+                BotError::Trading(format!("submit_order: {e}"))
+            })?;
 
         let mut res = self.parse_order_result(report, "Sell", &clean_qty, &clean_price, market, &coid)?;
 
@@ -3258,7 +3622,11 @@ impl TradingClient {
                     .build()
                 {
                     let retry_req = Uuid::new_v4().to_string();
-                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                    let retry_submit = client.submit_order(retry_order, Some(retry_req)).await;
+                    if let Err(ref retry_err) = retry_submit {
+                        error!(market = %market, error = %retry_err, "retry order submit failed");
+                    }
+                    if let Ok(retry_rep) = retry_submit {
                         if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &clean_qty, &retry_price, market, &retry_coid) {
                             res = retry_res;
                         }
@@ -3281,7 +3649,11 @@ impl TradingClient {
                     .build()
                 {
                     let retry_req = Uuid::new_v4().to_string();
-                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                    let retry_submit = client.submit_order(retry_order, Some(retry_req)).await;
+                    if let Err(ref retry_err) = retry_submit {
+                        error!(market = %market, error = %retry_err, "retry order submit failed");
+                    }
+                    if let Ok(retry_rep) = retry_submit {
                         if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &retry_qty, &clean_price, market, &retry_coid) {
                             res = retry_res;
                         }
@@ -3310,7 +3682,11 @@ impl TradingClient {
                             .build()
                         {
                             let retry_req = Uuid::new_v4().to_string();
-                            if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                            let retry_submit = client.submit_order(retry_order, Some(retry_req)).await;
+                            if let Err(ref retry_err) = retry_submit {
+                                error!(market = %market, error = %retry_err, "retry order submit failed");
+                            }
+                            if let Ok(retry_rep) = retry_submit {
                                 if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &retry_qty, &clean_price, market, &retry_coid) {
                                     res = retry_res;
                                     if res.success {
@@ -3336,107 +3712,9 @@ impl TradingClient {
         quantity: &str,
         price: Option<&str>,
     ) -> BotResult<OrderResult> {
-        let (clean_qty, decimals, _) = sanitize_order_quantity_for_market(market, quantity);
-        let (clean_price_opt, price_decimals) = match price {
-            Some(p) => {
-                let (cp, pd, _) = sanitize_order_price_for_market(market, p);
-                (Some(cp), pd)
-            }
-            None => (None, 0),
-        };
-        let coid = Uuid::new_v4().to_string();
-        let mut builder = SubmitOrderRequest::builder();
-        builder = builder.market(market).account(account_id);
-
-        if side.eq_ignore_ascii_case("buy") {
-            builder = builder.buy();
-        } else {
-            builder = builder.sell();
-        }
-
-        if let Some(ref p) = clean_price_opt {
-            builder = builder.limit_order(p).good_till_cancel();
-        } else {
-            builder = builder.market_order().immediate_or_cancel();
-        }
-
-        let order = builder
-            .quantity(&clean_qty)
-            .reduce_only(true)
-            .client_order_id(&coid)
-            .build()
-            .map_err(|e| BotError::Trading(format!("Build close order: {e}")))?;
-
-        let req_id = Uuid::new_v4().to_string();
         let client = self.create_user_signing_client(decrypted_key)?;
-        let report = client
-            .submit_order(order, Some(req_id))
+        self.place_reduce_only_order(&client, account_id, market, side, quantity, price)
             .await
-            .map_err(|e| BotError::Trading(format!("submit_order: {e}")))?;
-
-        let price_label = clean_price_opt.as_deref().unwrap_or("Market");
-        let mut res = self.parse_order_result(report, side, &clean_qty, price_label, market, &coid)?;
-
-        if !res.success && clean_price_opt.is_some() && res.error_msg.as_deref().map_or(false, is_price_decimal_error) {
-            let cur_p = clean_price_opt.as_deref().unwrap();
-            if let Some((retry_price, new_p_dec)) = next_fewer_decimal_price(market, cur_p, price_decimals) {
-                info!(market = %market, old_price_decimals = price_decimals, new_price_decimals = new_p_dec, retry_price = %retry_price, "Retrying user close order with 1 fewer price decimal place");
-                let retry_coid = Uuid::new_v4().to_string();
-                let mut retry_builder = SubmitOrderRequest::builder();
-                retry_builder = retry_builder.market(market).account(account_id);
-                if side.eq_ignore_ascii_case("buy") {
-                    retry_builder = retry_builder.buy();
-                } else {
-                    retry_builder = retry_builder.sell();
-                }
-                retry_builder = retry_builder.limit_order(&retry_price).good_till_cancel();
-                if let Ok(retry_order) = retry_builder
-                    .quantity(&clean_qty)
-                    .reduce_only(true)
-                    .client_order_id(&retry_coid)
-                    .build()
-                {
-                    let retry_req = Uuid::new_v4().to_string();
-                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
-                        if let Ok(retry_res) = self.parse_order_result(retry_rep, side, &clean_qty, &retry_price, market, &retry_coid) {
-                            res = retry_res;
-                        }
-                    }
-                }
-            }
-        } else if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
-            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
-                info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying user close order with 1 fewer decimal place");
-                let retry_coid = Uuid::new_v4().to_string();
-                let mut retry_builder = SubmitOrderRequest::builder();
-                retry_builder = retry_builder.market(market).account(account_id);
-                if side.eq_ignore_ascii_case("buy") {
-                    retry_builder = retry_builder.buy();
-                } else {
-                    retry_builder = retry_builder.sell();
-                }
-                if let Some(ref p) = clean_price_opt {
-                    retry_builder = retry_builder.limit_order(p).good_till_cancel();
-                } else {
-                    retry_builder = retry_builder.market_order().immediate_or_cancel();
-                }
-                if let Ok(retry_order) = retry_builder
-                    .quantity(&retry_qty)
-                    .reduce_only(true)
-                    .client_order_id(&retry_coid)
-                    .build()
-                {
-                    let retry_req = Uuid::new_v4().to_string();
-                    if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
-                        if let Ok(retry_res) = self.parse_order_result(retry_rep, side, &retry_qty, price_label, market, &retry_coid) {
-                            res = retry_res;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(res)
     }
 
     pub async fn cancel_user_all_orders(
@@ -3511,7 +3789,7 @@ impl TradingClient {
                 .unwrap_or_else(|| "unknown error".into());
 
             warn!("Order transaction rejected: {err_msg}");
-            return Ok(OrderResult {
+            let res = OrderResult {
                 success: false,
                 order_id: None,
                 client_order_id: client_order_id.to_string(),
@@ -3521,7 +3799,9 @@ impl TradingClient {
                 market: market.to_string(),
                 error_msg: Some(err_msg),
                 fills: vec![],
-            });
+            };
+            log_order_outcome(&res);
+            return Ok(res);
         }
 
         for receipt in &report.receipts {
@@ -3543,7 +3823,7 @@ impl TradingClient {
                     warn!("Order placed but engine rejected: {:?}", error_msg);
                 }
 
-                return Ok(OrderResult {
+                let res = OrderResult {
                     success: accepted,
                     order_id,
                     client_order_id: client_order_id.to_string(),
@@ -3553,12 +3833,14 @@ impl TradingClient {
                     market: market.to_string(),
                     error_msg,
                     fills,
-                });
+                };
+                log_order_outcome(&res);
+                return Ok(res);
             }
         }
 
         warn!("No SubmitOrderReport receipt in successful transaction");
-        Ok(OrderResult {
+        let res = OrderResult {
             success: report.success,
             order_id: None,
             client_order_id: client_order_id.to_string(),
@@ -3568,7 +3850,9 @@ impl TradingClient {
             market: market.to_string(),
             error_msg: None,
             fills: vec![],
-        })
+        };
+        log_order_outcome(&res);
+        Ok(res)
     }
 
     fn parse_cancel_result(&self, report: TransactionReport) -> CancelResult {
@@ -3601,4 +3885,94 @@ impl TradingClient {
     }
 }
 
-// Symmetrical trading parity verified: 100% sizing buffer and multi-stage margin reduction active for all users.
+// Symmetrical trading parity: admin and per-user market orders share place_marketable_order
+// (side-correct protective price, Error 114 / 121, InsufficientMargin 0.90 then 0.80).
+// Admin and per-user closes share place_reduce_only_order, including the
+// ReduceOnlyOrderExceedsPosition step-down. 100% sizing uses spendable_margin.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bal(equity: f64, available: f64, orders: f64, positions: f64) -> BalanceInfo {
+        BalanceInfo {
+            total_equity: equity,
+            available_margin: available,
+            margin_allocated_orders: orders,
+            margin_allocated_positions: positions,
+        }
+    }
+
+    #[test]
+    fn spendable_subtracts_order_margin_when_available_balance_still_includes_it() {
+        // Equity 7.949, $3 locked in a resting order, indexer available left near equity.
+        let info = bal(7.949, 7.56, 3.0, 0.0);
+        let spendable = info.spendable_margin();
+        assert!((spendable - 4.949).abs() < 1e-9);
+        let (usd, is_max) = margin_budget_for_percentage(spendable, 100.0);
+        assert!(is_max);
+        assert!((usd - 4.44).abs() < 1e-9);
+    }
+
+    #[test]
+    fn spendable_matches_available_when_indexer_already_netted_locks() {
+        // Live indexer identity: equity = available + orders + positions.
+        let info = bal(1217.204735660901, 943.7277918306023, 48.6136565, 224.86328733029877);
+        let spendable = info.spendable_margin();
+        assert!((spendable - info.available_margin).abs() < 1e-6);
+    }
+
+    #[test]
+    fn spendable_falls_back_to_available_when_equity_is_missing() {
+        let info = bal(0.0, 4.949, 0.0, 0.0);
+        assert!((info.spendable_margin() - 4.949).abs() < 1e-9);
+    }
+
+    #[test]
+    fn protective_price_is_above_mark_for_buys_and_below_for_sells() {
+        let mark = 81373.044;
+        let (buy_s, buy) = protective_slippage_price(mark, true, 1);
+        let (sell_s, sell) = protective_slippage_price(mark, false, 1);
+        assert!(buy > mark, "long protective {buy_s} should be above {mark}");
+        assert!(sell < mark, "short protective {sell_s} should be below {mark}");
+        // Inside the 1% trading bound so the IOC cap is not rejected.
+        assert!(buy < mark * 1.01);
+        assert!(sell > mark * 0.99);
+    }
+
+    #[test]
+    fn round_half_up_exceeds_position_floor_does_not() {
+        // Documents why closes must not use round_qty_to_decimals.
+        let (rounded, rounded_val) = round_qty_to_decimals(0.00325, 4);
+        assert_eq!(rounded, "0.0033");
+        assert!(rounded_val > 0.00325);
+        let (floored, floored_val) = format_close_qty(0.00325, 100.0, 4).unwrap();
+        assert_eq!(floored, "0.0032");
+        assert!(floored_val <= 0.00325);
+    }
+
+    #[test]
+    fn close_100_percent_floors_instead_of_rounding_past_the_position() {
+        // round_qty_to_decimals(0.00325, 4) is 0.0033, which exceeds the position.
+        let (qty, floored) = format_close_qty(0.00325, 100.0, 4).unwrap();
+        assert_eq!(qty, "0.0032");
+        assert!(floored <= 0.00325);
+        assert!(floored > 0.0);
+
+        // Exact lot is unchanged.
+        let (qty, _) = format_close_qty(0.0032, 100.0, 4).unwrap();
+        assert_eq!(qty, "0.0032");
+
+        // Partial close also floors rather than rounding up through the position.
+        let (qty, floored) = format_close_qty(0.0033, 50.0, 4).unwrap();
+        assert!(floored <= 0.0033 * 0.5 + 1e-12);
+        assert_eq!(qty, "0.0016");
+    }
+
+    #[test]
+    fn step_down_qty_moves_one_lot() {
+        let (qty, value) = step_down_qty("0.0033", 4).unwrap();
+        assert_eq!(qty, "0.0032");
+        assert!((value - 0.0032).abs() < 1e-12);
+    }
+}
