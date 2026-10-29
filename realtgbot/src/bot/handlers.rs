@@ -6,7 +6,9 @@
 use std::{sync::Arc, time::Duration};
 use teloxide::{
     prelude::*,
-    types::{CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode},
+    types::{
+        CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode,
+    },
 };
 use tracing::{error, info, warn};
 
@@ -40,9 +42,10 @@ pub fn main_menu_keyboard(is_connected: bool) -> InlineKeyboardMarkup {
         ])
     } else {
         InlineKeyboardMarkup::new(vec![
-            vec![
-                InlineKeyboardButton::callback("🔗 Connect Wallet", "action:connect"),
-            ],
+            vec![InlineKeyboardButton::callback(
+                "🔗 Connect Wallet",
+                "action:connect",
+            )],
             vec![
                 InlineKeyboardButton::callback("📊 Markets", "menu:markets"),
                 InlineKeyboardButton::callback("🔔 Alerts", "menu:alerts"),
@@ -52,19 +55,22 @@ pub fn main_menu_keyboard(is_connected: bool) -> InlineKeyboardMarkup {
 }
 
 pub fn connect_prompt_keyboard() -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback("❌ Cancel", "action:cancel"),
-    ]])
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+        "❌ Cancel",
+        "action:cancel",
+    )]])
 }
 
 pub fn unconnected_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
-        vec![
-            InlineKeyboardButton::callback("🔗 Connect Wallet", "action:connect"),
-        ],
-        vec![
-            InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main"),
-        ],
+        vec![InlineKeyboardButton::callback(
+            "🔗 Connect Wallet",
+            "action:connect",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "⬅️ Back to Menu",
+            "menu:main",
+        )],
     ])
 }
 
@@ -95,17 +101,20 @@ pub fn markets_keyboard(markets: &[crate::trading::MarketInfo]) -> InlineKeyboar
             None => String::new(),
         };
         let label = if m.mark_price > 0.0 {
-            format!("{icon} {} • ${}{change_str}", m.base_asset, format_usd(m.mark_price))
+            format!(
+                "{icon} {} • ${}{change_str}",
+                m.base_asset,
+                format_usd(m.mark_price)
+            )
         } else {
             format!("{icon} {}", m.symbol)
         };
-        rows.push(vec![
-            InlineKeyboardButton::callback(label, format!("market:{}", m.short_name)),
-        ]);
+        rows.push(vec![InlineKeyboardButton::callback(
+            label,
+            format!("market:{}", m.short_name),
+        )]);
     }
-    rows.push(vec![
-        InlineKeyboardButton::callback("⬅️ Back", "menu:main"),
-    ]);
+    rows.push(vec![InlineKeyboardButton::callback("⬅️ Back", "menu:main")]);
     InlineKeyboardMarkup::new(rows)
 }
 
@@ -113,15 +122,27 @@ pub fn market_actions_keyboard(symbol: &str) -> InlineKeyboardMarkup {
     let sym_lower = symbol.to_lowercase();
     InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback(format!("📈 Long {symbol}"), format!("trade:long:{sym_lower}")),
-            InlineKeyboardButton::callback(format!("📉 Short {symbol}"), format!("trade:short:{sym_lower}")),
+            InlineKeyboardButton::callback(
+                format!("📈 Long {symbol}"),
+                format!("trade:long:{sym_lower}"),
+            ),
+            InlineKeyboardButton::callback(
+                format!("📉 Short {symbol}"),
+                format!("trade:short:{sym_lower}"),
+            ),
         ],
         vec![
-            InlineKeyboardButton::callback(format!("❌ Close {symbol}"), format!("menu:close:{sym_lower}")),
+            InlineKeyboardButton::callback(
+                format!("❌ Close {symbol}"),
+                format!("menu:close:{sym_lower}"),
+            ),
             InlineKeyboardButton::callback("📋 Orders", "action:orders"),
         ],
         vec![
-            InlineKeyboardButton::callback(format!("🔔 Alert {symbol}"), format!("alert:market:{sym_lower}")),
+            InlineKeyboardButton::callback(
+                format!("🔔 Alert {symbol}"),
+                format!("alert:market:{sym_lower}"),
+            ),
             InlineKeyboardButton::callback("⬅️ Back", "menu:markets"),
         ],
     ])
@@ -135,26 +156,24 @@ pub fn close_options_keyboard(symbol: &str) -> InlineKeyboardMarkup {
             InlineKeyboardButton::callback("50%", format!("close:{sym_lower}:50")),
             InlineKeyboardButton::callback("100%", format!("close:{sym_lower}:100")),
         ],
-        vec![
-            InlineKeyboardButton::callback("✏️ Custom", format!("close_custom:{sym_lower}")),
-        ],
-        vec![
-            InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main"),
-        ],
+        vec![InlineKeyboardButton::callback(
+            "✏️ Custom",
+            format!("close_custom:{sym_lower}"),
+        )],
+        vec![InlineKeyboardButton::callback(
+            "⬅️ Back to Menu",
+            "menu:main",
+        )],
     ])
 }
 
 pub fn order_size_keyboard(back_callback: Option<&str>) -> InlineKeyboardMarkup {
-    let mut rows = vec![
-        vec![
-            InlineKeyboardButton::callback("25%", "size_pct:25"),
-            InlineKeyboardButton::callback("50%", "size_pct:50"),
-            InlineKeyboardButton::callback("100%", "size_pct:100"),
-        ],
-    ];
-    let mut nav_row = vec![
-        InlineKeyboardButton::callback("❌ Cancel", "action:cancel"),
-    ];
+    let mut rows = vec![vec![
+        InlineKeyboardButton::callback("25%", "size_pct:25"),
+        InlineKeyboardButton::callback("50%", "size_pct:50"),
+        InlineKeyboardButton::callback("100%", "size_pct:100"),
+    ]];
+    let mut nav_row = vec![InlineKeyboardButton::callback("❌ Cancel", "action:cancel")];
     if let Some(back) = back_callback {
         nav_row.push(InlineKeyboardButton::callback("⬅️ Back", back.to_string()));
     }
@@ -165,23 +184,27 @@ pub fn order_size_keyboard(back_callback: Option<&str>) -> InlineKeyboardMarkup 
 pub fn order_placed_keyboard(symbol: &str) -> InlineKeyboardMarkup {
     let sym_lower = symbol.to_lowercase();
     InlineKeyboardMarkup::new(vec![
-        vec![
-            InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main"),
-        ],
-        vec![
-            InlineKeyboardButton::callback("❌ Close Position", format!("menu:close:{sym_lower}")),
-        ],
+        vec![InlineKeyboardButton::callback(
+            "⬅️ Back to Menu",
+            "menu:main",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "❌ Close Position",
+            format!("menu:close:{sym_lower}"),
+        )],
     ])
 }
 
 pub fn pending_order_placed_keyboard(_symbol: &str) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
-        vec![
-            InlineKeyboardButton::callback("📋 View Open Orders", "action:orders"),
-        ],
-        vec![
-            InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main"),
-        ],
+        vec![InlineKeyboardButton::callback(
+            "📋 View Open Orders",
+            "action:orders",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "⬅️ Back to Menu",
+            "menu:main",
+        )],
     ])
 }
 
@@ -222,7 +245,10 @@ pub fn leverage_keyboard(max_leverage: Option<f64>) -> InlineKeyboardMarkup {
         rows.push(row1);
         rows.push(row2);
     }
-    rows.push(vec![InlineKeyboardButton::callback("❌ Cancel", "action:cancel")]);
+    rows.push(vec![InlineKeyboardButton::callback(
+        "❌ Cancel",
+        "action:cancel",
+    )]);
     InlineKeyboardMarkup::new(rows)
 }
 
@@ -232,9 +258,7 @@ pub fn order_type_keyboard() -> InlineKeyboardMarkup {
             InlineKeyboardButton::callback("⚡ Market Order", "ordertype:market"),
             InlineKeyboardButton::callback("🎯 Limit Order", "ordertype:limit"),
         ],
-        vec![
-            InlineKeyboardButton::callback("❌ Cancel", "action:cancel"),
-        ],
+        vec![InlineKeyboardButton::callback("❌ Cancel", "action:cancel")],
     ])
 }
 
@@ -244,9 +268,10 @@ pub fn alerts_menu_keyboard() -> InlineKeyboardMarkup {
             InlineKeyboardButton::callback("➕ Set Alert", "alerts:new"),
             InlineKeyboardButton::callback("📋 My Alerts", "alerts:list"),
         ],
-        vec![
-            InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main"),
-        ],
+        vec![InlineKeyboardButton::callback(
+            "⬅️ Back to Menu",
+            "menu:main",
+        )],
     ])
 }
 
@@ -266,18 +291,18 @@ pub fn alert_markets_keyboard(markets: &[crate::trading::MarketInfo]) -> InlineK
     if !current_row.is_empty() {
         rows.push(current_row);
     }
-    rows.push(vec![
-        InlineKeyboardButton::callback("⬅️ Back", "menu:alerts"),
-    ]);
+    rows.push(vec![InlineKeyboardButton::callback(
+        "⬅️ Back",
+        "menu:alerts",
+    )]);
     InlineKeyboardMarkup::new(rows)
 }
 
 pub fn back_to_main_keyboard() -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new(vec![
-        vec![
-            InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main"),
-        ],
-    ])
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+        "⬅️ Back to Menu",
+        "menu:main",
+    )]])
 }
 
 // ─── Edit or Send Helper ──────────────────────────────────────────────────────
@@ -418,9 +443,15 @@ pub async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>) -> Res
                 // Instantly delete the user's message containing private key
                 let _ = bot.delete_message(chat_id, msg.id).await;
                 state.clear_session(chat_id).await;
-                Box::pin(handle_connect_private_key(&bot, chat_id, user_id, username, &state, text)).await
+                Box::pin(handle_connect_private_key(
+                    &bot, chat_id, user_id, username, &state, text,
+                ))
+                .await
             } else {
-                Box::pin(handle_trade_step(&bot, chat_id, user_id, &state, pending, text)).await
+                Box::pin(handle_trade_step(
+                    &bot, chat_id, user_id, &state, pending, text,
+                ))
+                .await
             }
         }
         None => {
@@ -460,7 +491,14 @@ pub async fn handle_callback(
 
     if data == "menu:main" {
         state.clear_session(chat_id).await;
-        Box::pin(show_main_menu(&bot, chat_id, Some(message_id), user_id, &state)).await?;
+        Box::pin(show_main_menu(
+            &bot,
+            chat_id,
+            Some(message_id),
+            user_id,
+            &state,
+        ))
+        .await?;
     } else if data == "action:connect" {
         Box::pin(cmd_connect(&bot, chat_id, user_id, username, &state, "")).await?;
     } else if data == "action:disconnect" {
@@ -468,12 +506,25 @@ pub async fn handle_callback(
     } else if data == "menu:markets" {
         Box::pin(show_markets_menu(&bot, chat_id, Some(message_id), &state)).await?;
     } else if let Some(sym) = data.strip_prefix("market:") {
-        Box::pin(show_market_actions_menu(&bot, chat_id, Some(message_id), sym, &state)).await?;
+        Box::pin(show_market_actions_menu(
+            &bot,
+            chat_id,
+            Some(message_id),
+            sym,
+            &state,
+        ))
+        .await?;
     } else if let Some(sym) = data.strip_prefix("menu:close:") {
         if state.users.get_user(user_id).await.is_none() {
             Box::pin(show_not_connected_notice(&bot, chat_id, Some(message_id))).await?;
         } else {
-            Box::pin(show_close_options_menu(&bot, chat_id, Some(message_id), sym)).await?;
+            Box::pin(show_close_options_menu(
+                &bot,
+                chat_id,
+                Some(message_id),
+                sym,
+            ))
+            .await?;
         }
     } else if let Some(rest) = data.strip_prefix("trade:") {
         if state.users.get_user(user_id).await.is_none() {
@@ -486,7 +537,16 @@ pub async fn handle_callback(
                 } else {
                     TradeDirection::Short
                 };
-                Box::pin(start_trade_from_button(&bot, chat_id, Some(message_id), user_id, &state, dir, parts[1])).await?;
+                Box::pin(start_trade_from_button(
+                    &bot,
+                    chat_id,
+                    Some(message_id),
+                    user_id,
+                    &state,
+                    dir,
+                    parts[1],
+                ))
+                .await?;
             }
         }
     } else if let Some(rest) = data.strip_prefix("close:") {
@@ -494,51 +554,162 @@ pub async fn handle_callback(
         if parts.len() == 2 {
             let symbol = parts[0];
             let pct: f64 = parts[1].parse().unwrap_or(100.0);
-            Box::pin(execute_button_close(&bot, chat_id, Some(message_id), user_id, &state, symbol, pct)).await?;
+            Box::pin(execute_button_close(
+                &bot,
+                chat_id,
+                Some(message_id),
+                user_id,
+                &state,
+                symbol,
+                pct,
+            ))
+            .await?;
         }
     } else if let Some(sym) = data.strip_prefix("close_custom:") {
         if state.users.get_user(user_id).await.is_none() {
             Box::pin(show_not_connected_notice(&bot, chat_id, Some(message_id))).await?;
         } else {
-            Box::pin(prompt_custom_close_percentage(&bot, chat_id, Some(message_id), sym, &state)).await?;
+            Box::pin(prompt_custom_close_percentage(
+                &bot,
+                chat_id,
+                Some(message_id),
+                sym,
+                &state,
+            ))
+            .await?;
         }
     } else if let Some(pct_str) = data.strip_prefix("size_pct:") {
         if let Ok(pct) = pct_str.parse::<f64>() {
-            Box::pin(handle_order_size_percentage(&bot, chat_id, user_id, &state, pct)).await?;
+            Box::pin(handle_order_size_percentage(
+                &bot, chat_id, user_id, &state, pct,
+            ))
+            .await?;
         }
     } else if let Some(lev_str) = data.strip_prefix("lev:") {
         if let Ok(lev) = lev_str.parse::<f64>() {
-            Box::pin(handle_leverage_selection(&bot, chat_id, user_id, &state, lev)).await?;
+            Box::pin(handle_leverage_selection(
+                &bot, chat_id, user_id, &state, lev,
+            ))
+            .await?;
         }
     } else if let Some(choice_str) = data.strip_prefix("ordertype:") {
-        Box::pin(handle_order_type_choice(&bot, chat_id, user_id, &state, choice_str)).await?;
+        Box::pin(handle_order_type_choice(
+            &bot, chat_id, user_id, &state, choice_str,
+        ))
+        .await?;
     } else if data == "action:positions" {
-        Box::pin(show_positions_view(&bot, chat_id, Some(message_id), user_id, &state)).await?;
+        Box::pin(show_positions_view(
+            &bot,
+            chat_id,
+            Some(message_id),
+            user_id,
+            &state,
+        ))
+        .await?;
     } else if data == "action:orders" {
-        Box::pin(show_orders_view(&bot, chat_id, Some(message_id), user_id, &state)).await?;
+        Box::pin(show_orders_view(
+            &bot,
+            chat_id,
+            Some(message_id),
+            user_id,
+            &state,
+        ))
+        .await?;
     } else if let Some(rest) = data.strip_prefix("cancel_order:") {
-        Box::pin(handle_cancel_order_button(&bot, chat_id, Some(message_id), user_id, &state, rest)).await?;
+        Box::pin(handle_cancel_order_button(
+            &bot,
+            chat_id,
+            Some(message_id),
+            user_id,
+            &state,
+            rest,
+        ))
+        .await?;
     } else if let Some(rest) = data.strip_prefix("cnl:") {
-        Box::pin(handle_cancel_order_button(&bot, chat_id, Some(message_id), user_id, &state, rest)).await?;
+        Box::pin(handle_cancel_order_button(
+            &bot,
+            chat_id,
+            Some(message_id),
+            user_id,
+            &state,
+            rest,
+        ))
+        .await?;
     } else if data == "action:history" {
-        Box::pin(show_history_view(&bot, chat_id, Some(message_id), user_id, &state)).await?;
+        Box::pin(show_history_view(
+            &bot,
+            chat_id,
+            Some(message_id),
+            user_id,
+            &state,
+        ))
+        .await?;
     } else if data == "menu:alerts" {
         Box::pin(show_alerts_menu(&bot, chat_id, Some(message_id))).await?;
     } else if data == "alerts:new" {
-        Box::pin(show_alert_market_select(&bot, chat_id, Some(message_id), &state)).await?;
+        Box::pin(show_alert_market_select(
+            &bot,
+            chat_id,
+            Some(message_id),
+            &state,
+        ))
+        .await?;
     } else if data == "alerts:list" {
-        Box::pin(show_alerts_list(&bot, chat_id, Some(message_id), user_id, &state)).await?;
+        Box::pin(show_alerts_list(
+            &bot,
+            chat_id,
+            Some(message_id),
+            user_id,
+            &state,
+        ))
+        .await?;
     } else if let Some(sym) = data.strip_prefix("alert:market:") {
-        Box::pin(start_alert_setup(&bot, chat_id, Some(message_id), &state, sym)).await?;
+        Box::pin(start_alert_setup(
+            &bot,
+            chat_id,
+            Some(message_id),
+            &state,
+            sym,
+        ))
+        .await?;
     } else if let Some(alert_id) = data.strip_prefix("alert:del:") {
-        Box::pin(handle_delete_alert(&bot, chat_id, Some(message_id), user_id, &state, alert_id)).await?;
+        Box::pin(handle_delete_alert(
+            &bot,
+            chat_id,
+            Some(message_id),
+            user_id,
+            &state,
+            alert_id,
+        ))
+        .await?;
     } else if data == "action:balance" {
-        Box::pin(show_balance_view(&bot, chat_id, Some(message_id), user_id, &state)).await?;
+        Box::pin(show_balance_view(
+            &bot,
+            chat_id,
+            Some(message_id),
+            user_id,
+            &state,
+        ))
+        .await?;
     } else if data == "action:volume" {
-        Box::pin(show_volume_view(&bot, chat_id, Some(message_id), user_id, &state)).await?;
+        Box::pin(show_volume_view(
+            &bot,
+            chat_id,
+            Some(message_id),
+            user_id,
+            &state,
+        ))
+        .await?;
     } else if data == "action:cancel" {
         state.clear_session(chat_id).await;
-        Box::pin(show_main_menu(&bot, chat_id, Some(message_id), user_id, &state)).await?;
+        Box::pin(show_main_menu(
+            &bot,
+            chat_id,
+            Some(message_id),
+            user_id,
+            &state,
+        ))
+        .await?;
     }
 
     Ok(())
@@ -563,9 +734,15 @@ async fn show_main_menu(
             } else {
                 u.address.clone()
             };
-            (format!("🟢 Connected: `{short}`\nAccount ID: `{}`", u.account_id), true)
+            (
+                format!("🟢 Connected: `{short}`\nAccount ID: `{}`", u.account_id),
+                true,
+            )
         }
-        None => ("⚪ Wallet: *Not Connected* (Tap Connect Wallet to start)".to_string(), false),
+        None => (
+            "⚪ Wallet: *Not Connected* (Tap Connect Wallet to start)".to_string(),
+            false,
+        ),
     };
 
     let text = format!(
@@ -574,10 +751,16 @@ async fn show_main_menu(
          Network: `{}`\n\
          {}\n\n\
          Select an option below:",
-        network_str,
-        status_line
+        network_str, status_line
     );
-    edit_or_send(bot, chat_id, message_id, &text, main_menu_keyboard(is_connected)).await
+    edit_or_send(
+        bot,
+        chat_id,
+        message_id,
+        &text,
+        main_menu_keyboard(is_connected),
+    )
+    .await
 }
 
 async fn show_markets_menu(
@@ -602,7 +785,9 @@ async fn show_market_actions_menu(
     let sym_upper = symbol.to_uppercase();
     let icon = asset_icon(&sym_upper);
 
-    let market_id = state.resolve_market(symbol).unwrap_or_else(|| sym_upper.clone());
+    let market_id = state
+        .resolve_market(symbol)
+        .unwrap_or_else(|| sym_upper.clone());
     let stats_res = state.trading.get_market_stats(&market_id).await;
 
     let stats_text = match stats_res {
@@ -693,7 +878,9 @@ async fn prompt_custom_close_percentage(
     symbol: &str,
     state: &BotState,
 ) -> ResponseResult<()> {
-    let market_id = state.resolve_market(symbol).unwrap_or_else(|| symbol.to_string());
+    let market_id = state
+        .resolve_market(symbol)
+        .unwrap_or_else(|| symbol.to_string());
     let sym_upper = BotState::market_name(&market_id);
 
     let pending = PendingTrade {
@@ -747,7 +934,11 @@ async fn show_balance_view(
         }
     };
 
-    match state.trading.get_user_balance(&account_id, indexer_id.as_deref()).await {
+    match state
+        .trading
+        .get_user_balance(&account_id, indexer_id.as_deref())
+        .await
+    {
         Ok(bal) => {
             let spendable = bal.spendable_margin();
             let locked_line = if bal.margin_allocated_orders > 0.009 {
@@ -790,12 +981,17 @@ async fn show_volume_view(
         }
     };
 
-    match state.trading.get_user_volume(&account_id, indexer_id.as_deref()).await {
+    match state
+        .trading
+        .get_user_volume(&account_id, indexer_id.as_deref())
+        .await
+    {
         Ok(vol) => {
             let mut lines = vec![format!("• Total: *${}*", format_volume(vol.total))];
             if !vol.by_market.is_empty() {
                 let mut sorted_markets: Vec<_> = vol.by_market.iter().collect();
-                sorted_markets.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+                sorted_markets
+                    .sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
                 for (sym, notional) in sorted_markets {
                     let icon = asset_icon(sym);
                     lines.push(format!("• {icon} {sym}: *${}*", format_volume(*notional)));
@@ -839,8 +1035,14 @@ async fn show_positions_view(
         Ok(positions) if positions.is_empty() => {
             let text = "📋 *Open Positions*\n\nYou currently have no open positions.";
             let kb = InlineKeyboardMarkup::new(vec![
-                vec![InlineKeyboardButton::callback("📊 Open a Position", "menu:markets")],
-                vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
+                vec![InlineKeyboardButton::callback(
+                    "📊 Open a Position",
+                    "menu:markets",
+                )],
+                vec![InlineKeyboardButton::callback(
+                    "⬅️ Back to Menu",
+                    "menu:main",
+                )],
             ]);
             edit_or_send(bot, chat_id, message_id, text, kb).await?;
         }
@@ -850,7 +1052,11 @@ async fn show_positions_view(
 
             for pos in &positions {
                 let sym = BotState::market_name(&pos.market_id);
-                let pnl_emoji = if pos.unrealized_pnl >= 0.0 { "🟢" } else { "🔴" };
+                let pnl_emoji = if pos.unrealized_pnl >= 0.0 {
+                    "🟢"
+                } else {
+                    "🔴"
+                };
                 let pnl_sign = if pos.unrealized_pnl >= 0.0 { "+" } else { "" };
                 let roe_sign = if pos.roe_pct >= 0.0 { "+" } else { "" };
 
@@ -873,15 +1079,16 @@ async fn show_positions_view(
                     roe = pos.roe_pct,
                 ));
 
-                close_buttons.push(vec![
-                    InlineKeyboardButton::callback(
-                        format!("❌ Close {sym}"),
-                        format!("menu:close:{}", sym.to_lowercase()),
-                    )
-                ]);
+                close_buttons.push(vec![InlineKeyboardButton::callback(
+                    format!("❌ Close {sym}"),
+                    format!("menu:close:{}", sym.to_lowercase()),
+                )]);
             }
 
-            close_buttons.push(vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")]);
+            close_buttons.push(vec![InlineKeyboardButton::callback(
+                "⬅️ Back to Menu",
+                "menu:main",
+            )]);
             let kb = InlineKeyboardMarkup::new(close_buttons);
             edit_or_send(bot, chat_id, message_id, &text, kb).await?;
         }
@@ -920,13 +1127,11 @@ async fn show_orders_view(
 
     send_typing(bot, chat_id).await;
 
-    let orders_future = state
-        .trading
-        .get_user_open_orders(
-            &account_id,
-            trading_obj_id.as_deref(),
-            indexer_id.as_deref(),
-        );
+    let orders_future = state.trading.get_user_open_orders(
+        &account_id,
+        trading_obj_id.as_deref(),
+        indexer_id.as_deref(),
+    );
 
     let res = tokio::time::timeout(Duration::from_secs(8), orders_future).await;
 
@@ -934,9 +1139,18 @@ async fn show_orders_view(
         Ok(Ok(orders)) if orders.is_empty() => {
             let text = "📋 *Open Limit Orders*\n\nNo open limit orders.";
             let kb = InlineKeyboardMarkup::new(vec![
-                vec![InlineKeyboardButton::callback("📊 Place an Order", "menu:markets")],
-                vec![InlineKeyboardButton::callback("🔄 Refresh", "action:orders")],
-                vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
+                vec![InlineKeyboardButton::callback(
+                    "📊 Place an Order",
+                    "menu:markets",
+                )],
+                vec![InlineKeyboardButton::callback(
+                    "🔄 Refresh",
+                    "action:orders",
+                )],
+                vec![InlineKeyboardButton::callback(
+                    "⬅️ Back to Menu",
+                    "menu:main",
+                )],
             ]);
             let _ = edit_or_send(bot, chat_id, message_id, text, kb).await;
         }
@@ -946,7 +1160,8 @@ async fn show_orders_view(
 
             for ord in &orders {
                 let sym = &ord.market_symbol;
-                let is_buy = ord.side.eq_ignore_ascii_case("buy") || ord.side.eq_ignore_ascii_case("long");
+                let is_buy =
+                    ord.side.eq_ignore_ascii_case("buy") || ord.side.eq_ignore_ascii_case("long");
                 let side_emoji = if is_buy { "🟢 BUY" } else { "🔴 SELL" };
 
                 let time_str = if ord.timestamp > 0 {
@@ -957,11 +1172,12 @@ async fn show_orders_view(
                     "Recent".into()
                 };
 
-                let remaining_str = if ord.remaining_quantity < ord.quantity && ord.remaining_quantity > 0.0 {
-                    format!("`{}` / `{}` {}", ord.remaining_quantity, ord.quantity, sym)
-                } else {
-                    format!("`{}` {}", ord.quantity, sym)
-                };
+                let remaining_str =
+                    if ord.remaining_quantity < ord.quantity && ord.remaining_quantity > 0.0 {
+                        format!("`{}` / `{}` {}", ord.remaining_quantity, ord.quantity, sym)
+                    } else {
+                        format!("`{}` {}", ord.quantity, sym)
+                    };
 
                 text.push_str(&format!(
                     "• *{sym}* | {side_emoji}\n\
@@ -977,12 +1193,10 @@ async fn show_orders_view(
                 ));
 
                 // Compact callback_data (under 64 bytes limit in Telegram)
-                buttons.push(vec![
-                    InlineKeyboardButton::callback(
-                        format!("❌ Cancel {side_emoji} {sym} @ ${}", format_usd(ord.price)),
-                        format!("cnl:{}:{}", sym.to_lowercase(), ord.order_id_str),
-                    )
-                ]);
+                buttons.push(vec![InlineKeyboardButton::callback(
+                    format!("❌ Cancel {side_emoji} {sym} @ ${}", format_usd(ord.price)),
+                    format!("cnl:{}:{}", sym.to_lowercase(), ord.order_id_str),
+                )]);
             }
 
             buttons.push(vec![
@@ -999,7 +1213,10 @@ async fn show_orders_view(
             );
             let kb = InlineKeyboardMarkup::new(vec![
                 vec![InlineKeyboardButton::callback("🔄 Retry", "action:orders")],
-                vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
+                vec![InlineKeyboardButton::callback(
+                    "⬅️ Back to Menu",
+                    "menu:main",
+                )],
             ]);
             let _ = edit_or_send(bot, chat_id, message_id, &err_text, kb).await;
         }
@@ -1007,7 +1224,10 @@ async fn show_orders_view(
             let timeout_text = "⚠️ *Request Timed Out*\n\nThe Real.xyz indexer took too long to respond. Please try refreshing in a few moments.";
             let kb = InlineKeyboardMarkup::new(vec![
                 vec![InlineKeyboardButton::callback("🔄 Retry", "action:orders")],
-                vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
+                vec![InlineKeyboardButton::callback(
+                    "⬅️ Back to Menu",
+                    "menu:main",
+                )],
             ]);
             let _ = edit_or_send(bot, chat_id, message_id, timeout_text, kb).await;
         }
@@ -1031,12 +1251,16 @@ async fn handle_cancel_order_button(
 
     let parts: Vec<&str> = rest.split(':').collect();
     if parts.len() != 2 {
-        bot.send_message(chat_id, "❌ Invalid cancel request.").await?;
+        bot.send_message(chat_id, "❌ Invalid cancel request.")
+            .await?;
         return Ok(());
     }
 
     let market_key = parts[0];
-    let market_id = state.trading.resolve_market(market_key).unwrap_or_else(|| market_key.to_string());
+    let market_id = state
+        .trading
+        .resolve_market(market_key)
+        .unwrap_or_else(|| market_key.to_string());
     let order_id: u128 = match parts[1].parse::<u128>() {
         Ok(id) => id,
         Err(_) => {
@@ -1055,19 +1279,31 @@ async fn handle_cancel_order_button(
 
     let market_sym = BotState::market_name(&market_id);
     let res = if let Some(user) = user_opt {
-        let decrypted = match crate::crypto::decrypt_user_key(&state.config.encryption_key, user_id, &user.encrypted_privkey) {
+        let decrypted = match crate::crypto::decrypt_user_key(
+            &state.config.encryption_key,
+            user_id,
+            &user.encrypted_privkey,
+        ) {
             Ok(k) => k,
             Err(e) => {
-                bot.send_message(chat_id, format!("❌ Decryption error: {e}")).await?;
+                bot.send_message(chat_id, format!("❌ Decryption error: {e}"))
+                    .await?;
                 return Ok(());
             }
         };
 
-        let mut r = state.trading.cancel_user_order_by_id(&user.account_id, &decrypted, &market_id, order_id).await;
+        let mut r = state
+            .trading
+            .cancel_user_order_by_id(&user.account_id, &decrypted, &market_id, order_id)
+            .await;
         if r.as_ref().map_or(false, |c| !c.success) {
             if let Some(ref toid) = user.trading_account_object_id {
                 if !toid.eq_ignore_ascii_case(&user.account_id) {
-                    if let Ok(retry_cancel) = state.trading.cancel_user_order_by_id(toid, &decrypted, &market_id, order_id).await {
+                    if let Ok(retry_cancel) = state
+                        .trading
+                        .cancel_user_order_by_id(toid, &decrypted, &market_id, order_id)
+                        .await
+                    {
                         if retry_cancel.success {
                             r = Ok(retry_cancel);
                         }
@@ -1091,8 +1327,14 @@ async fn handle_cancel_order_button(
                  • Status: Cancelled on Real.xyz engine"
             );
             let kb = InlineKeyboardMarkup::new(vec![
-                vec![InlineKeyboardButton::callback("📋 View Open Orders", "action:orders")],
-                vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
+                vec![InlineKeyboardButton::callback(
+                    "📋 View Open Orders",
+                    "action:orders",
+                )],
+                vec![InlineKeyboardButton::callback(
+                    "⬅️ Back to Menu",
+                    "menu:main",
+                )],
             ]);
             let _ = edit_or_send(bot, chat_id, message_id, &text, kb).await;
         }
@@ -1103,8 +1345,14 @@ async fn handle_cancel_order_button(
                  It may have already been filled or cancelled."
             );
             let kb = InlineKeyboardMarkup::new(vec![
-                vec![InlineKeyboardButton::callback("📋 View Open Orders", "action:orders")],
-                vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
+                vec![InlineKeyboardButton::callback(
+                    "📋 View Open Orders",
+                    "action:orders",
+                )],
+                vec![InlineKeyboardButton::callback(
+                    "⬅️ Back to Menu",
+                    "menu:main",
+                )],
             ]);
             let _ = edit_or_send(bot, chat_id, message_id, &text, kb).await;
         }
@@ -1145,7 +1393,11 @@ async fn show_history_view(
             let mut text = String::from("📜 *Recent Trade History (Last 8 Fills)*\n\n");
             for f in &fills {
                 let sym = &f.market_symbol;
-                let side_emoji = if f.side.eq_ignore_ascii_case("buy") { "🟢 BUY" } else { "🔴 SELL" };
+                let side_emoji = if f.side.eq_ignore_ascii_case("buy") {
+                    "🟢 BUY"
+                } else {
+                    "🔴 SELL"
+                };
                 let time_str = if f.timestamp > 0 {
                     chrono::DateTime::from_timestamp_millis(f.timestamp)
                         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
@@ -1193,7 +1445,14 @@ async fn show_alert_market_select(
 ) -> ResponseResult<()> {
     let markets = state.trading.get_markets().await;
     let text = "🔔 *New Price Alert*\n\nSelect an asset to set an alert for:";
-    edit_or_send(bot, chat_id, message_id, text, alert_markets_keyboard(&markets)).await
+    edit_or_send(
+        bot,
+        chat_id,
+        message_id,
+        text,
+        alert_markets_keyboard(&markets),
+    )
+    .await
 }
 
 async fn show_alerts_list(
@@ -1207,8 +1466,14 @@ async fn show_alerts_list(
     if alerts.is_empty() {
         let text = "🔔 *Your Price Alerts*\n\nYou have no active price alerts.";
         let kb = InlineKeyboardMarkup::new(vec![
-            vec![InlineKeyboardButton::callback("➕ Add New Alert", "alerts:new")],
-            vec![InlineKeyboardButton::callback("⬅️ Back to Menu", "menu:main")],
+            vec![InlineKeyboardButton::callback(
+                "➕ Add New Alert",
+                "alerts:new",
+            )],
+            vec![InlineKeyboardButton::callback(
+                "⬅️ Back to Menu",
+                "menu:main",
+            )],
         ]);
         edit_or_send(bot, chat_id, message_id, text, kb).await?;
         return Ok(());
@@ -1219,7 +1484,11 @@ async fn show_alerts_list(
 
     for a in &alerts {
         let cond = if a.trigger_above { "≥" } else { "≤" };
-        let status = if a.triggered { "⚡ Triggered" } else { "⏳ Active" };
+        let status = if a.triggered {
+            "⚡ Triggered"
+        } else {
+            "⏳ Active"
+        };
         text.push_str(&format!(
             "• *{}* {} *${}* ({})\n",
             a.symbol,
@@ -1238,7 +1507,14 @@ async fn show_alerts_list(
         InlineKeyboardButton::callback("⬅️ Back", "menu:alerts"),
     ]);
 
-    edit_or_send(bot, chat_id, message_id, &text, InlineKeyboardMarkup::new(buttons)).await
+    edit_or_send(
+        bot,
+        chat_id,
+        message_id,
+        &text,
+        InlineKeyboardMarkup::new(buttons),
+    )
+    .await
 }
 
 async fn start_alert_setup(
@@ -1249,8 +1525,14 @@ async fn start_alert_setup(
     symbol: &str,
 ) -> ResponseResult<()> {
     let sym_upper = symbol.to_uppercase();
-    let market_id = state.resolve_market(symbol).unwrap_or_else(|| sym_upper.clone());
-    let mark_price = state.trading.get_market_mark_price(&market_id).await.unwrap_or(0.0);
+    let market_id = state
+        .resolve_market(symbol)
+        .unwrap_or_else(|| sym_upper.clone());
+    let mark_price = state
+        .trading
+        .get_market_mark_price(&market_id)
+        .await
+        .unwrap_or(0.0);
 
     let pending = PendingTrade {
         direction: TradeDirection::Long,
@@ -1275,9 +1557,10 @@ async fn start_alert_setup(
          Please enter the target price to trigger an alert\n*(e.g. 85000, 3150, 185)*:"
     );
 
-    let cancel_kb = InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback("❌ Cancel", "action:cancel"),
-    ]]);
+    let cancel_kb = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+        "❌ Cancel",
+        "action:cancel",
+    )]]);
 
     edit_or_send(bot, chat_id, message_id, &text, cancel_kb).await
 }
@@ -1335,28 +1618,30 @@ async fn handle_connect_private_key(
     };
 
     // Lookup on-chain account in Real.xyz indexer
-    let (account_id, trading_account_obj_id) = match state.trading.lookup_account_by_address(&address).await {
-        Some(lookup) => (lookup.account_id, lookup.trading_account_object_id),
-        None => {
-            // If not found in indexer accounts yet, default to address
-            (address.clone(), None)
-        }
-    };
+    let (account_id, trading_account_obj_id) =
+        match state.trading.lookup_account_by_address(&address).await {
+            Some(lookup) => (lookup.account_id, lookup.trading_account_object_id),
+            None => {
+                // If not found in indexer accounts yet, default to address
+                (address.clone(), None)
+            }
+        };
 
     // Encrypt the key with AES-256-GCM using master key + user_id
-    let encrypted = match crate::crypto::encrypt_user_key(&state.config.encryption_key, user_id, key) {
-        Ok(enc) => enc,
-        Err(e) => {
-            bot.send_message(
-                chat_id,
-                format!("❌ *Encryption Error*\n\nFailed to securely encrypt key: {e}"),
-            )
-            .reply_markup(main_menu_keyboard(false))
-            .parse_mode(ParseMode::Markdown)
-            .await?;
-            return Ok(());
-        }
-    };
+    let encrypted =
+        match crate::crypto::encrypt_user_key(&state.config.encryption_key, user_id, key) {
+            Ok(enc) => enc,
+            Err(e) => {
+                bot.send_message(
+                    chat_id,
+                    format!("❌ *Encryption Error*\n\nFailed to securely encrypt key: {e}"),
+                )
+                .reply_markup(main_menu_keyboard(false))
+                .parse_mode(ParseMode::Markdown)
+                .await?;
+                return Ok(());
+            }
+        };
 
     let user_record = crate::users::StoredUser {
         telegram_id: user_id,
@@ -1494,7 +1779,10 @@ async fn start_trade_from_button(
             return Ok(());
         }
     };
-    let _ = state.trading.get_market_max_leverage_async(&market_id).await;
+    let _ = state
+        .trading
+        .get_market_max_leverage_async(&market_id)
+        .await;
     let sym_upper = BotState::market_name(&market_id);
 
     let pending = PendingTrade {
@@ -1512,7 +1800,11 @@ async fn start_trade_from_button(
 
     let user_opt = state.users.get_user(user_id).await;
     let bal_info = match user_opt {
-        Some(ref u) => state.trading.get_user_balance(&u.account_id, u.indexer_account_id.as_deref()).await.ok(),
+        Some(ref u) => state
+            .trading
+            .get_user_balance(&u.account_id, u.indexer_account_id.as_deref())
+            .await
+            .ok(),
         None => None,
     };
     let bal_line = match bal_info {
@@ -1556,10 +1848,18 @@ async fn handle_order_size_percentage(
         }
     };
 
-    let bal = match state.trading.get_user_balance(&user.account_id, user.indexer_account_id.as_deref()).await {
+    let bal = match state
+        .trading
+        .get_user_balance(&user.account_id, user.indexer_account_id.as_deref())
+        .await
+    {
         Ok(b) => b,
         Err(e) => {
-            bot.send_message(chat_id, format!("❌ Failed to fetch available balance: {e}")).await?;
+            bot.send_message(
+                chat_id,
+                format!("❌ Failed to fetch available balance: {e}"),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -1598,7 +1898,10 @@ async fn handle_order_size_percentage(
         return Ok(());
     }
 
-    let max_lev = state.trading.get_market_max_leverage_async(&pending.market_id).await;
+    let max_lev = state
+        .trading
+        .get_market_max_leverage_async(&pending.market_id)
+        .await;
     pending.step = TradeStep::AwaitingLeverage { usd_amount: usd };
     state.set_session(chat_id, pending).await;
 
@@ -1635,7 +1938,10 @@ async fn handle_leverage_selection(
             if let TradeStep::AwaitingLeverage { usd_amount } = pending.step {
                 let max_lev = state.trading.get_market_max_leverage(&pending.market_id);
                 let clamped_leverage = leverage.min(max_lev).max(1.0);
-                pending.step = TradeStep::AwaitingOrderType { usd_amount, leverage: clamped_leverage };
+                pending.step = TradeStep::AwaitingOrderType {
+                    usd_amount,
+                    leverage: clamped_leverage,
+                };
                 state.set_session(chat_id, pending).await;
                 bot.send_message(
                     chat_id,
@@ -1669,7 +1975,11 @@ async fn handle_order_type_choice(
     let session = state.get_session(chat_id).await;
     match session {
         Some(mut pending) => {
-            if let TradeStep::AwaitingOrderType { usd_amount, leverage } = pending.step {
+            if let TradeStep::AwaitingOrderType {
+                usd_amount,
+                leverage,
+            } = pending.step
+            {
                 if choice_str == "market" {
                     state.clear_session(chat_id).await;
                     execute_conversational_trade(
@@ -1688,11 +1998,16 @@ async fn handle_order_type_choice(
                     .await?;
                 } else if choice_str == "limit" {
                     let market_symbol = pending.market_symbol.clone();
-                    pending.step = TradeStep::AwaitingLimitPrice { usd_amount, leverage };
+                    pending.step = TradeStep::AwaitingLimitPrice {
+                        usd_amount,
+                        leverage,
+                    };
                     state.set_session(chat_id, pending).await;
-                    let cancel_kb = InlineKeyboardMarkup::new(vec![vec![
-                        InlineKeyboardButton::callback("❌ Cancel", "action:cancel"),
-                    ]]);
+                    let cancel_kb =
+                        InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+                            "❌ Cancel",
+                            "action:cancel",
+                        )]]);
                     bot.send_message(
                         chat_id,
                         format!("🎯 *Limit Order Price*\n\nWhat price would you like to place your limit order at for *{market_symbol}*?\n*(e.g. 84500, 3200)*"),
@@ -1744,7 +2059,11 @@ async fn execute_button_close(
 
     let pos_opt = match state
         .trading
-        .get_user_open_position(&user.account_id, user.indexer_account_id.as_deref(), &market_id)
+        .get_user_open_position(
+            &user.account_id,
+            user.indexer_account_id.as_deref(),
+            &market_id,
+        )
         .await
     {
         Ok(p) => p,
@@ -1780,11 +2099,16 @@ async fn execute_button_close(
         }
     };
 
-    let is_pos_long = pos.direction.eq_ignore_ascii_case("long") || pos.direction.eq_ignore_ascii_case("buy");
+    let is_pos_long =
+        pos.direction.eq_ignore_ascii_case("long") || pos.direction.eq_ignore_ascii_case("buy");
     let close_side = if is_pos_long { "Sell" } else { "Buy" };
 
     // Decrypt key into Zeroizing buffer
-    let decrypted = match crate::crypto::decrypt_user_key(&state.config.encryption_key, user_id, &user.encrypted_privkey) {
+    let decrypted = match crate::crypto::decrypt_user_key(
+        &state.config.encryption_key,
+        user_id,
+        &user.encrypted_privkey,
+    ) {
         Ok(k) => k,
         Err(e) => {
             let err_text = format!("❌ *Decryption Error*\n\n{e}");
@@ -1795,7 +2119,14 @@ async fn execute_button_close(
 
     let res = state
         .trading
-        .place_user_close_order(&user.account_id, &decrypted, &market_id, close_side, &qty_str, None)
+        .place_user_close_order(
+            &user.account_id,
+            &decrypted,
+            &market_id,
+            close_side,
+            &qty_str,
+            None,
+        )
         .await;
 
     drop(decrypted);
@@ -1827,7 +2158,9 @@ async fn execute_button_close(
             edit_or_send(bot, chat_id, message_id, &text, back_to_main_keyboard()).await?;
         }
         Ok(order) => {
-            let err = order.error_msg.unwrap_or_else(|| "Engine rejected order".into());
+            let err = order
+                .error_msg
+                .unwrap_or_else(|| "Engine rejected order".into());
             error!(
                 user_id,
                 market = %sym_upper,
@@ -1870,7 +2203,10 @@ async fn handle_trade_step(
                 None => {
                     bot.send_message(
                         chat_id,
-                        format!("❌ Please choose a valid market: {} (or tap Cancel):", state.available_markets_summary()),
+                        format!(
+                            "❌ Please choose a valid market: {} (or tap Cancel):",
+                            state.available_markets_summary()
+                        ),
                     )
                     .reply_markup(markets_keyboard(&state.trading.get_cached_markets()))
                     .parse_mode(ParseMode::Markdown)
@@ -1891,7 +2227,11 @@ async fn handle_trade_step(
 
             let user_opt = state.users.get_user(user_id).await;
             let bal_info = match user_opt {
-                Some(ref u) => state.trading.get_user_balance(&u.account_id, u.indexer_account_id.as_deref()).await.ok(),
+                Some(ref u) => state
+                    .trading
+                    .get_user_balance(&u.account_id, u.indexer_account_id.as_deref())
+                    .await
+                    .ok(),
                 None => None,
             };
             let bal_line = match bal_info {
@@ -1939,10 +2279,18 @@ async fn handle_trade_step(
                     }
                 };
 
-                let bal = match state.trading.get_user_balance(&user.account_id, user.indexer_account_id.as_deref()).await {
+                let bal = match state
+                    .trading
+                    .get_user_balance(&user.account_id, user.indexer_account_id.as_deref())
+                    .await
+                {
                     Ok(b) => b,
                     Err(e) => {
-                        bot.send_message(chat_id, format!("❌ Failed to fetch available balance: {e}")).await?;
+                        bot.send_message(
+                            chat_id,
+                            format!("❌ Failed to fetch available balance: {e}"),
+                        )
+                        .await?;
                         return Ok(());
                     }
                 };
@@ -1968,7 +2316,8 @@ async fn handle_trade_step(
                     return Ok(());
                 }
 
-                let (calc_usd, is_max) = crate::trading::margin_budget_for_percentage(spendable, pct);
+                let (calc_usd, is_max) =
+                    crate::trading::margin_budget_for_percentage(spendable, pct);
 
                 if calc_usd <= 0.0 {
                     bot.send_message(
@@ -1997,7 +2346,11 @@ async fn handle_trade_step(
 
                 let user_opt = state.users.get_user(user_id).await;
                 let bal_opt = if let Some(ref u) = user_opt {
-                    state.trading.get_user_balance(&u.account_id, u.indexer_account_id.as_deref()).await.ok()
+                    state
+                        .trading
+                        .get_user_balance(&u.account_id, u.indexer_account_id.as_deref())
+                        .await
+                        .ok()
                 } else {
                     None
                 };
@@ -2027,7 +2380,10 @@ async fn handle_trade_step(
                 }
             };
 
-            let max_lev = state.trading.get_market_max_leverage_async(&pending.market_id).await;
+            let max_lev = state
+                .trading
+                .get_market_max_leverage_async(&pending.market_id)
+                .await;
             pending.step = TradeStep::AwaitingLeverage { usd_amount: usd };
             state.set_session(chat_id, pending).await;
 
@@ -2057,7 +2413,10 @@ async fn handle_trade_step(
                 }
             };
 
-            pending.step = TradeStep::AwaitingOrderType { usd_amount, leverage: lev };
+            pending.step = TradeStep::AwaitingOrderType {
+                usd_amount,
+                leverage: lev,
+            };
             state.set_session(chat_id, pending).await;
             bot.send_message(
                 chat_id,
@@ -2075,14 +2434,19 @@ async fn handle_trade_step(
             .reply_markup(order_type_keyboard())
             .await?;
         }
-        TradeStep::AwaitingLimitPrice { usd_amount, leverage } => {
+        TradeStep::AwaitingLimitPrice {
+            usd_amount,
+            leverage,
+        } => {
             let cleaned = text.trim().replace('$', "").replace(',', "");
             let price = match cleaned.parse::<f64>() {
                 Ok(v) if v > 0.0 => v,
                 _ => {
-                    let cancel_kb = InlineKeyboardMarkup::new(vec![vec![
-                        InlineKeyboardButton::callback("❌ Cancel", "action:cancel"),
-                    ]]);
+                    let cancel_kb =
+                        InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+                            "❌ Cancel",
+                            "action:cancel",
+                        )]]);
                     bot.send_message(
                         chat_id,
                         "❌ Please enter a valid limit price (e.g. 84500) or tap Cancel:",
@@ -2093,7 +2457,11 @@ async fn handle_trade_step(
                 }
             };
 
-            if let Ok(mark) = state.trading.get_market_mark_price(&pending.market_id).await {
+            if let Ok(mark) = state
+                .trading
+                .get_market_mark_price(&pending.market_id)
+                .await
+            {
                 if mark > 0.0 {
                     match pending.direction {
                         TradeDirection::Long if price >= mark => {
@@ -2172,9 +2540,11 @@ async fn handle_trade_step(
             let target_price = match cleaned.parse::<f64>() {
                 Ok(v) if v > 0.0 => v,
                 _ => {
-                    let cancel_kb = InlineKeyboardMarkup::new(vec![vec![
-                        InlineKeyboardButton::callback("❌ Cancel", "action:cancel"),
-                    ]]);
+                    let cancel_kb =
+                        InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+                            "❌ Cancel",
+                            "action:cancel",
+                        )]]);
                     bot.send_message(
                         chat_id,
                         "❌ Please enter a valid target price (e.g. 85000) or tap Cancel:",
@@ -2185,9 +2555,17 @@ async fn handle_trade_step(
                 }
             };
 
-            let current_price = state.trading.get_market_mark_price(&market_id).await.unwrap_or(target_price);
+            let current_price = state
+                .trading
+                .get_market_mark_price(&market_id)
+                .await
+                .unwrap_or(target_price);
             let trigger_above = target_price >= current_price;
-            let dir_str = if trigger_above { "rises to or above" } else { "drops to or below" };
+            let dir_str = if trigger_above {
+                "rises to or above"
+            } else {
+                "drops to or below"
+            };
 
             let alert = crate::alerts::PriceAlert {
                 id: uuid::Uuid::new_v4().to_string()[..8].to_string(),
@@ -2223,7 +2601,10 @@ async fn handle_trade_step(
                 .parse_mode(ParseMode::Markdown)
                 .await?;
         }
-        TradeStep::AwaitingClosePercentage { market_id: _, symbol } => {
+        TradeStep::AwaitingClosePercentage {
+            market_id: _,
+            symbol,
+        } => {
             state.clear_session(chat_id).await;
             let cleaned = text.trim().replace('%', "");
             let pct = match cleaned.trim().parse::<f64>() {
@@ -2283,7 +2664,9 @@ async fn execute_conversational_trade(
         Ok(_) | Err(_) => {
             bot.send_message(
                 chat_id,
-                format!("❌ Unable to fetch current market price for {symbol}. Please try again later."),
+                format!(
+                    "❌ Unable to fetch current market price for {symbol}. Please try again later."
+                ),
             )
             .reply_markup(back_to_main_keyboard())
             .await?;
@@ -2339,30 +2722,55 @@ async fn execute_conversational_trade(
         }
     }
 
-    // Sizing price calculation:
-    // 1. For Limit orders (both Long and Short):
-    //    - Limit Buy is placed below mark price. Evaluating at limit price would make raw_qty
-    //      larger than at mark price, exceeding available margin when validated by the engine.
-    //      Therefore, we size against max(limit_price, mark_price) * 1.01.
-    //    - Limit Sell is placed above mark price. Sizing against max(limit_price, mark_price) * 1.01
-    //      (which is limit_price * 1.01) reserves a safe margin buffer for order collateral.
-    // 2. For Market orders (both Long and Short):
-    //    Quantity is sized against mark * 1.015 (above the mark) so a fill inside the
-    //    1% trading bound, plus fees, still fits in the USD budget.
-    //    The order itself is an IOC limit at a side-correct protective price
-    //    (long: above the mark, short: below). That price is NOT the sizing price:
-    //    sizing a short at the lower cap would increase quantity and can demand
-    //    more margin than is free.
-    let exec_price = if let Some(p) = limit_price {
-        p.max(mark_price) * 1.01
-    } else {
-        mark_price * 1.015
-    };
-    let total_notional = usd_amount * leverage;
-    let raw_qty = total_notional / exec_price;
+    let is_market = matches!(order_type, crate::bot::state::OrderTypeChoice::Market);
+    let is_buy = matches!(direction, TradeDirection::Long);
 
-    let decimals = crate::trading::get_cached_market_decimals(market_id);
-    let (qty_str, rounded_qty) = crate::trading::floor_qty_to_decimals(raw_qty, decimals);
+    // Market size is `budget / (P*imr + P*taker_fee + slippage)`, with leverage
+    // capped at 1/imr. P is the book-walking protective price, solved together
+    // with the quantity. Limit orders still size off the more expensive of the
+    // limit and the mark so a resting order cannot demand more margin than
+    // the user allocated.
+    let (qty_str, rounded_qty, price_str, exec_price, total_notional) = if is_market {
+        match state
+            .trading
+            .resolve_marketable_qty(market_id, is_buy, usd_amount, leverage, None)
+            .await
+        {
+            Ok(quote) if quote.quantity_f > 0.0 => {
+                let notional = quote.quantity_f * quote.price_f;
+                (
+                    quote.quantity,
+                    quote.quantity_f,
+                    quote.price,
+                    quote.price_f,
+                    notional,
+                )
+            }
+            Ok(_) | Err(_) => {
+                bot.send_message(
+                    chat_id,
+                    format!("❌ Order size for {symbol} is too small for the available margin. Please increase your USD amount or leverage."),
+                )
+                .reply_markup(back_to_main_keyboard())
+                .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        let limit_px = limit_price.unwrap_or(mark_price);
+        let exec_price = limit_px.max(mark_price) * 1.01;
+        let total_notional = usd_amount * leverage;
+        let raw_qty = if exec_price > 0.0 {
+            total_notional / exec_price
+        } else {
+            0.0
+        };
+        let decimals = crate::trading::get_cached_market_decimals(market_id);
+        let (qty_str, rounded_qty) = crate::trading::floor_qty_to_decimals(raw_qty, decimals);
+        let price_str =
+            crate::trading::sanitize_order_price_for_market(market_id, &limit_px.to_string()).0;
+        (qty_str, rounded_qty, price_str, exec_price, total_notional)
+    };
 
     if rounded_qty <= 0.0 {
         bot.send_message(
@@ -2379,20 +2787,6 @@ async fn execute_conversational_trade(
         TradeDirection::Short => ("Short", "📉"),
     };
 
-    let price_str = match (order_type, limit_price, direction) {
-        (crate::bot::state::OrderTypeChoice::Limit, Some(p), _) => {
-            crate::trading::sanitize_order_price_for_market(market_id, &p.to_string()).0
-        }
-        (_, _, TradeDirection::Long) => {
-            let price_decimals = crate::trading::get_cached_market_price_decimals(market_id);
-            crate::trading::protective_slippage_price(mark_price, true, price_decimals).0
-        }
-        (_, _, TradeDirection::Short) => {
-            let price_decimals = crate::trading::get_cached_market_price_decimals(market_id);
-            crate::trading::protective_slippage_price(mark_price, false, price_decimals).0
-        }
-    };
-
     info!(
         user_id = user_id,
         market = %symbol,
@@ -2402,7 +2796,7 @@ async fn execute_conversational_trade(
         limit_price = ?limit_price,
         mark_price = mark_price,
         exec_price = exec_price,
-        raw_qty = raw_qty,
+        qty = rounded_qty,
         qty_str = %qty_str,
         price_str = %price_str,
         usd_amount = usd_amount,
@@ -2411,15 +2805,16 @@ async fn execute_conversational_trade(
     );
 
     // Decrypt key into Zeroizing buffer
-    let decrypted = match crate::crypto::decrypt_user_key(&state.config.encryption_key, user_id, &user.encrypted_privkey) {
+    let decrypted = match crate::crypto::decrypt_user_key(
+        &state.config.encryption_key,
+        user_id,
+        &user.encrypted_privkey,
+    ) {
         Ok(k) => k,
         Err(e) => {
-            bot.send_message(
-                chat_id,
-                format!("❌ *Decryption Error*\n\n{e}"),
-            )
-            .reply_markup(back_to_main_keyboard())
-            .await?;
+            bot.send_message(chat_id, format!("❌ *Decryption Error*\n\n{e}"))
+                .reply_markup(back_to_main_keyboard())
+                .await?;
             return Ok(());
         }
     };
@@ -2430,16 +2825,52 @@ async fn execute_conversational_trade(
     // The position remains open until the user manually triggers a close.
     let res = match (direction, order_type) {
         (TradeDirection::Long, crate::bot::state::OrderTypeChoice::Market) => {
-            state.trading.place_user_market_long(&user.account_id, &decrypted, market_id, &qty_str, Some(&price_str)).await
+            state
+                .trading
+                .place_user_market_long(
+                    &user.account_id,
+                    &decrypted,
+                    market_id,
+                    &qty_str,
+                    Some(&price_str),
+                )
+                .await
         }
         (TradeDirection::Short, crate::bot::state::OrderTypeChoice::Market) => {
-            state.trading.place_user_market_short(&user.account_id, &decrypted, market_id, &qty_str, Some(&price_str)).await
+            state
+                .trading
+                .place_user_market_short(
+                    &user.account_id,
+                    &decrypted,
+                    market_id,
+                    &qty_str,
+                    Some(&price_str),
+                )
+                .await
         }
         (TradeDirection::Long, crate::bot::state::OrderTypeChoice::Limit) => {
-            state.trading.place_user_limit_long(&user.account_id, &decrypted, market_id, &qty_str, &price_str).await
+            state
+                .trading
+                .place_user_limit_long(
+                    &user.account_id,
+                    &decrypted,
+                    market_id,
+                    &qty_str,
+                    &price_str,
+                )
+                .await
         }
         (TradeDirection::Short, crate::bot::state::OrderTypeChoice::Limit) => {
-            state.trading.place_user_limit_short(&user.account_id, &decrypted, market_id, &qty_str, &price_str).await
+            state
+                .trading
+                .place_user_limit_short(
+                    &user.account_id,
+                    &decrypted,
+                    market_id,
+                    &qty_str,
+                    &price_str,
+                )
+                .await
         }
     };
 
@@ -2460,7 +2891,11 @@ async fn execute_conversational_trade(
             let order_id = order.order_id.unwrap_or_else(|| "N/A".into());
             let is_limit = matches!(order_type, crate::bot::state::OrderTypeChoice::Limit);
             let is_pending = is_limit && order.fills.is_empty();
-            let final_qty = if !order.quantity.is_empty() { &order.quantity } else { &qty_str };
+            let final_qty = if !order.quantity.is_empty() {
+                &order.quantity
+            } else {
+                &qty_str
+            };
 
             if is_pending {
                 let p = limit_price.unwrap_or(exec_price);
@@ -2487,6 +2922,15 @@ async fn execute_conversational_trade(
                     .reply_markup(pending_order_placed_keyboard(&symbol))
                     .parse_mode(ParseMode::Markdown)
                     .await?;
+            } else if is_market && order.fills.is_empty() {
+                let reason = order
+                    .error_msg
+                    .clone()
+                    .unwrap_or_else(|| "IOC order did not trade".to_string());
+                bot.send_message(chat_id, format!("⚠️ *Order not filled*\n\n{reason}"))
+                    .reply_markup(back_to_main_keyboard())
+                    .parse_mode(ParseMode::Markdown)
+                    .await?;
             } else {
                 let fill_summary = if !order.fills.is_empty() {
                     let fill_str = order
@@ -2506,7 +2950,11 @@ async fn execute_conversational_trade(
                 };
 
                 let price_line = match limit_price {
-                    Some(p) => format!("• Limit Price: *${}*\n• Mark Price: *${}*", format_usd(p), format_usd(mark_price)),
+                    Some(p) => format!(
+                        "• Limit Price: *${}*\n• Mark Price: *${}*",
+                        format_usd(p),
+                        format_usd(mark_price)
+                    ),
                     None => format!("• Price: *Market* (${})", format_usd(mark_price)),
                 };
 
@@ -2532,7 +2980,9 @@ async fn execute_conversational_trade(
             }
         }
         Ok(order) => {
-            let err = order.error_msg.unwrap_or_else(|| "Engine rejected order".into());
+            let err = order
+                .error_msg
+                .unwrap_or_else(|| "Engine rejected order".into());
             error!(
                 user_id,
                 market = %symbol,
@@ -2543,13 +2993,18 @@ async fn execute_conversational_trade(
                 error = %err,
                 "execute_conversational_trade: order rejected"
             );
-            bot.send_message(
-                chat_id,
-                format!("❌ *Order Rejected*\n\nReason: {err}"),
-            )
-            .reply_markup(back_to_main_keyboard())
-            .parse_mode(ParseMode::Markdown)
-            .await?;
+            let text = if is_market
+                && order.fills.is_empty()
+                && crate::trading::order_was_not_filled(&err)
+            {
+                format!("⚠️ *Order not filled*\n\n{err}")
+            } else {
+                format!("❌ *Order Rejected*\n\nReason: {err}")
+            };
+            bot.send_message(chat_id, text)
+                .reply_markup(back_to_main_keyboard())
+                .parse_mode(ParseMode::Markdown)
+                .await?;
         }
         Err(e) => {
             error!(
@@ -2558,13 +3013,10 @@ async fn execute_conversational_trade(
                 error = %e,
                 "execute_conversational_trade: order failed"
             );
-            bot.send_message(
-                chat_id,
-                format!("❌ *Failed to submit order*\n\n{e}"),
-            )
-            .reply_markup(back_to_main_keyboard())
-            .parse_mode(ParseMode::Markdown)
-            .await?;
+            bot.send_message(chat_id, format!("❌ *Failed to submit order*\n\n{e}"))
+                .reply_markup(back_to_main_keyboard())
+                .parse_mode(ParseMode::Markdown)
+                .await?;
         }
     }
 
@@ -2573,11 +3025,21 @@ async fn execute_conversational_trade(
 
 // ─── Slash Command Handlers ───────────────────────────────────────────────────
 
-async fn cmd_start(bot: &Bot, chat_id: ChatId, user_id: u64, state: &BotState) -> ResponseResult<()> {
+async fn cmd_start(
+    bot: &Bot,
+    chat_id: ChatId,
+    user_id: u64,
+    state: &BotState,
+) -> ResponseResult<()> {
     show_main_menu(bot, chat_id, None, user_id, state).await
 }
 
-async fn cmd_help(bot: &Bot, chat_id: ChatId, user_id: u64, state: &BotState) -> ResponseResult<()> {
+async fn cmd_help(
+    bot: &Bot,
+    chat_id: ChatId,
+    user_id: u64,
+    state: &BotState,
+) -> ResponseResult<()> {
     let is_connected = state.users.get_user(user_id).await.is_some();
     let conn_status = if is_connected {
         "🟢 *Wallet Connected*"
@@ -2613,15 +3075,30 @@ async fn cmd_help(bot: &Bot, chat_id: ChatId, user_id: u64, state: &BotState) ->
     Ok(())
 }
 
-async fn cmd_positions(bot: &Bot, chat_id: ChatId, user_id: u64, state: &BotState) -> ResponseResult<()> {
+async fn cmd_positions(
+    bot: &Bot,
+    chat_id: ChatId,
+    user_id: u64,
+    state: &BotState,
+) -> ResponseResult<()> {
     show_positions_view(bot, chat_id, None, user_id, state).await
 }
 
-async fn cmd_orders(bot: &Bot, chat_id: ChatId, user_id: u64, state: &BotState) -> ResponseResult<()> {
+async fn cmd_orders(
+    bot: &Bot,
+    chat_id: ChatId,
+    user_id: u64,
+    state: &BotState,
+) -> ResponseResult<()> {
     show_orders_view(bot, chat_id, None, user_id, state).await
 }
 
-async fn cmd_history(bot: &Bot, chat_id: ChatId, user_id: u64, state: &BotState) -> ResponseResult<()> {
+async fn cmd_history(
+    bot: &Bot,
+    chat_id: ChatId,
+    user_id: u64,
+    state: &BotState,
+) -> ResponseResult<()> {
     show_history_view(bot, chat_id, None, user_id, state).await
 }
 
@@ -2652,16 +3129,27 @@ async fn cmd_alert(
             None => {
                 bot.send_message(
                     chat_id,
-                    format!("❌ Unknown market. Available: {}", state.available_markets_summary()),
+                    format!(
+                        "❌ Unknown market. Available: {}",
+                        state.available_markets_summary()
+                    ),
                 )
                 .await?;
                 return Ok(());
             }
         };
         let sym_upper = BotState::market_name(&market_id);
-        let current_price = state.trading.get_market_mark_price(&market_id).await.unwrap_or(target_price);
+        let current_price = state
+            .trading
+            .get_market_mark_price(&market_id)
+            .await
+            .unwrap_or(target_price);
         let trigger_above = target_price >= current_price;
-        let dir_str = if trigger_above { "rises to or above" } else { "drops to or below" };
+        let dir_str = if trigger_above {
+            "rises to or above"
+        } else {
+            "drops to or below"
+        };
 
         let alert = crate::alerts::PriceAlert {
             id: uuid::Uuid::new_v4().to_string()[..8].to_string(),
@@ -2708,9 +3196,12 @@ async fn cmd_admin(
     match state.config.admin_user_id {
         Some(admin_id) if admin_id == user_id => {}
         _ => {
-            bot.send_message(chat_id, "⛔ *Access Denied*: You are not authorized to use admin commands.")
-                .parse_mode(ParseMode::Markdown)
-                .await?;
+            bot.send_message(
+                chat_id,
+                "⛔ *Access Denied*: You are not authorized to use admin commands.",
+            )
+            .parse_mode(ParseMode::Markdown)
+            .await?;
             return Ok(());
         }
     }
@@ -2727,7 +3218,11 @@ async fn cmd_admin(
         .filter(|u| u.connected_at >= seven_days_ago)
         .count();
 
-    let total_vol = state.trading.get_all_users_volume(&all_users).await.unwrap_or(0.0);
+    let total_vol = state
+        .trading
+        .get_all_users_volume(&all_users)
+        .await
+        .unwrap_or(0.0);
 
     let text = format!(
         "👑 *Pocket Real Admin Dashboard*\n\n\
@@ -2746,11 +3241,21 @@ async fn cmd_admin(
     Ok(())
 }
 
-async fn cmd_balance(bot: &Bot, chat_id: ChatId, user_id: u64, state: &BotState) -> ResponseResult<()> {
+async fn cmd_balance(
+    bot: &Bot,
+    chat_id: ChatId,
+    user_id: u64,
+    state: &BotState,
+) -> ResponseResult<()> {
     show_balance_view(bot, chat_id, None, user_id, state).await
 }
 
-async fn cmd_volume(bot: &Bot, chat_id: ChatId, user_id: u64, state: &BotState) -> ResponseResult<()> {
+async fn cmd_volume(
+    bot: &Bot,
+    chat_id: ChatId,
+    user_id: u64,
+    state: &BotState,
+) -> ResponseResult<()> {
     // /volume strictly displays user trading volume statistics; it NEVER places any orders.
     show_volume_view(bot, chat_id, None, user_id, state).await
 }
@@ -2781,7 +3286,16 @@ async fn cmd_long(
     }
 
     if tokens.len() == 1 {
-        start_trade_from_button(bot, chat_id, None, user_id, state, TradeDirection::Long, tokens[0]).await?;
+        start_trade_from_button(
+            bot,
+            chat_id,
+            None,
+            user_id,
+            state,
+            TradeDirection::Long,
+            tokens[0],
+        )
+        .await?;
         return Ok(());
     }
 
@@ -2796,10 +3310,15 @@ async fn cmd_long(
     send_typing(bot, chat_id).await;
 
     let user = state.users.get_user(user_id).await.unwrap();
-    let decrypted = match crate::crypto::decrypt_user_key(&state.config.encryption_key, user_id, &user.encrypted_privkey) {
+    let decrypted = match crate::crypto::decrypt_user_key(
+        &state.config.encryption_key,
+        user_id,
+        &user.encrypted_privkey,
+    ) {
         Ok(k) => k,
         Err(e) => {
-            bot.send_message(chat_id, format!("❌ Decryption error: {e}")).await?;
+            bot.send_message(chat_id, format!("❌ Decryption error: {e}"))
+                .await?;
             return Ok(());
         }
     };
@@ -2809,20 +3328,50 @@ async fn cmd_long(
     // Under no circumstances place an opposing short, hedge, or auto-closing order.
     // The position remains open until the user manually triggers a close.
     let res = match parsed {
-        ParsedOrderArgs::Market { ref market, ref qty } => {
-            state.trading.place_user_market_long(&user.account_id, &decrypted, market, qty, None).await
+        ParsedOrderArgs::Market {
+            ref market,
+            ref qty,
+        } => {
+            let (sized_qty, price) = state
+                .trading
+                .cap_requested_market_qty(
+                    &user.account_id,
+                    user.indexer_account_id.as_deref(),
+                    market,
+                    true,
+                    qty,
+                )
+                .await;
+            state
+                .trading
+                .place_user_market_long(
+                    &user.account_id,
+                    &decrypted,
+                    market,
+                    &sized_qty,
+                    price.as_deref(),
+                )
+                .await
         }
-        ParsedOrderArgs::Limit { ref market, ref qty, ref price } => {
-            state.trading.place_user_limit_long(&user.account_id, &decrypted, market, qty, price).await
+        ParsedOrderArgs::Limit {
+            ref market,
+            ref qty,
+            ref price,
+        } => {
+            state
+                .trading
+                .place_user_limit_long(&user.account_id, &decrypted, market, qty, price)
+                .await
         }
     };
     drop(decrypted);
 
     let (text, is_success, is_pending) = match res {
         Ok(ref r) => {
-            let is_limit = matches!(parsed, ParsedOrderArgs::Limit { .. });
-            let pending = is_limit && r.fills.is_empty() && r.success;
-            (format_order_result(r), r.success, pending)
+            let is_market = matches!(parsed, ParsedOrderArgs::Market { .. });
+            let pending = !is_market && r.fills.is_empty() && r.success;
+            let filled = r.success && (!is_market || !r.fills.is_empty());
+            (format_order_result(r), filled, pending)
         }
         Err(e) => (format!("❌ Failed to place order: {e}"), false, false),
     };
@@ -2863,7 +3412,16 @@ async fn cmd_short(
     }
 
     if tokens.len() == 1 {
-        start_trade_from_button(bot, chat_id, None, user_id, state, TradeDirection::Short, tokens[0]).await?;
+        start_trade_from_button(
+            bot,
+            chat_id,
+            None,
+            user_id,
+            state,
+            TradeDirection::Short,
+            tokens[0],
+        )
+        .await?;
         return Ok(());
     }
 
@@ -2878,10 +3436,15 @@ async fn cmd_short(
     send_typing(bot, chat_id).await;
 
     let user = state.users.get_user(user_id).await.unwrap();
-    let decrypted = match crate::crypto::decrypt_user_key(&state.config.encryption_key, user_id, &user.encrypted_privkey) {
+    let decrypted = match crate::crypto::decrypt_user_key(
+        &state.config.encryption_key,
+        user_id,
+        &user.encrypted_privkey,
+    ) {
         Ok(k) => k,
         Err(e) => {
-            bot.send_message(chat_id, format!("❌ Decryption error: {e}")).await?;
+            bot.send_message(chat_id, format!("❌ Decryption error: {e}"))
+                .await?;
             return Ok(());
         }
     };
@@ -2891,20 +3454,50 @@ async fn cmd_short(
     // Under no circumstances place an opposing long, hedge, or auto-closing order.
     // The position remains open until the user manually triggers a close.
     let res = match parsed {
-        ParsedOrderArgs::Market { ref market, ref qty } => {
-            state.trading.place_user_market_short(&user.account_id, &decrypted, market, qty, None).await
+        ParsedOrderArgs::Market {
+            ref market,
+            ref qty,
+        } => {
+            let (sized_qty, price) = state
+                .trading
+                .cap_requested_market_qty(
+                    &user.account_id,
+                    user.indexer_account_id.as_deref(),
+                    market,
+                    false,
+                    qty,
+                )
+                .await;
+            state
+                .trading
+                .place_user_market_short(
+                    &user.account_id,
+                    &decrypted,
+                    market,
+                    &sized_qty,
+                    price.as_deref(),
+                )
+                .await
         }
-        ParsedOrderArgs::Limit { ref market, ref qty, ref price } => {
-            state.trading.place_user_limit_short(&user.account_id, &decrypted, market, qty, price).await
+        ParsedOrderArgs::Limit {
+            ref market,
+            ref qty,
+            ref price,
+        } => {
+            state
+                .trading
+                .place_user_limit_short(&user.account_id, &decrypted, market, qty, price)
+                .await
         }
     };
     drop(decrypted);
 
     let (text, is_success, is_pending) = match res {
         Ok(ref r) => {
-            let is_limit = matches!(parsed, ParsedOrderArgs::Limit { .. });
-            let pending = is_limit && r.fills.is_empty() && r.success;
-            (format_order_result(r), r.success, pending)
+            let is_market = matches!(parsed, ParsedOrderArgs::Market { .. });
+            let pending = !is_market && r.fills.is_empty() && r.success;
+            let filled = r.success && (!is_market || !r.fills.is_empty());
+            (format_order_result(r), filled, pending)
         }
         Err(e) => (format!("❌ Failed to place order: {e}"), false, false),
     };
@@ -2965,18 +3558,19 @@ async fn cmd_close(
 
     let pos_opt = match state
         .trading
-        .get_user_open_position(&user.account_id, user.indexer_account_id.as_deref(), &market_id)
+        .get_user_open_position(
+            &user.account_id,
+            user.indexer_account_id.as_deref(),
+            &market_id,
+        )
         .await
     {
         Ok(p) => p,
         Err(e) => {
-            bot.send_message(
-                chat_id,
-                format!("❌ Failed to check positions: {e}"),
-            )
-            .reply_markup(back_to_main_keyboard())
-            .parse_mode(ParseMode::Markdown)
-            .await?;
+            bot.send_message(chat_id, format!("❌ Failed to check positions: {e}"))
+                .reply_markup(back_to_main_keyboard())
+                .parse_mode(ParseMode::Markdown)
+                .await?;
             return Ok(());
         }
     };
@@ -3014,26 +3608,35 @@ async fn cmd_close(
         }
     };
 
-    let is_pos_long = pos.direction.eq_ignore_ascii_case("long") || pos.direction.eq_ignore_ascii_case("buy");
+    let is_pos_long =
+        pos.direction.eq_ignore_ascii_case("long") || pos.direction.eq_ignore_ascii_case("buy");
     let close_side = if is_pos_long { "Sell" } else { "Buy" };
 
     // Decrypt key into Zeroizing buffer
-    let decrypted = match crate::crypto::decrypt_user_key(&state.config.encryption_key, user_id, &user.encrypted_privkey) {
+    let decrypted = match crate::crypto::decrypt_user_key(
+        &state.config.encryption_key,
+        user_id,
+        &user.encrypted_privkey,
+    ) {
         Ok(k) => k,
         Err(e) => {
-            bot.send_message(
-                chat_id,
-                format!("❌ Decryption error: {e}"),
-            )
-            .reply_markup(back_to_main_keyboard())
-            .await?;
+            bot.send_message(chat_id, format!("❌ Decryption error: {e}"))
+                .reply_markup(back_to_main_keyboard())
+                .await?;
             return Ok(());
         }
     };
 
     let res = state
         .trading
-        .place_user_close_order(&user.account_id, &decrypted, &market_id, close_side, &qty_str, manual_price.as_deref())
+        .place_user_close_order(
+            &user.account_id,
+            &decrypted,
+            &market_id,
+            close_side,
+            &qty_str,
+            manual_price.as_deref(),
+        )
         .await;
 
     drop(decrypted);
@@ -3071,7 +3674,9 @@ async fn cmd_close(
                 .await?;
         }
         Ok(order) => {
-            let err = order.error_msg.unwrap_or_else(|| "Engine rejected order".into());
+            let err = order
+                .error_msg
+                .unwrap_or_else(|| "Engine rejected order".into());
             error!(
                 user_id,
                 market = %symbol,
@@ -3091,13 +3696,10 @@ async fn cmd_close(
         }
         Err(e) => {
             error!(user_id, market = %symbol, error = %e, "cmd_close: order failed");
-            bot.send_message(
-                chat_id,
-                format!("❌ *Failed to submit close order*\n\n{e}"),
-            )
-            .reply_markup(back_to_main_keyboard())
-            .parse_mode(ParseMode::Markdown)
-            .await?;
+            bot.send_message(chat_id, format!("❌ *Failed to submit close order*\n\n{e}"))
+                .reply_markup(back_to_main_keyboard())
+                .parse_mode(ParseMode::Markdown)
+                .await?;
         }
     }
 
@@ -3107,7 +3709,11 @@ async fn cmd_close(
 fn parse_close_args(tokens: &[&str], state: &BotState) -> (String, f64, Option<String>) {
     if tokens.is_empty() {
         return (
-            state.config.default_market.clone().unwrap_or_else(|| "btc".into()),
+            state
+                .config
+                .default_market
+                .clone()
+                .unwrap_or_else(|| "btc".into()),
             100.0,
             None,
         );
@@ -3115,7 +3721,11 @@ fn parse_close_args(tokens: &[&str], state: &BotState) -> (String, f64, Option<S
 
     let token0_clean = tokens[0].trim_end_matches('%');
     if let Ok(num) = token0_clean.parse::<f64>() {
-        let default_m = state.config.default_market.clone().unwrap_or_else(|| "btc".into());
+        let default_m = state
+            .config
+            .default_market
+            .clone()
+            .unwrap_or_else(|| "btc".into());
         if num <= 100.0 {
             let price = tokens.get(1).map(|s| s.to_string());
             return (default_m, num, price);
@@ -3146,14 +3756,18 @@ fn parse_close_args(tokens: &[&str], state: &BotState) -> (String, f64, Option<S
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 enum ParsedOrderArgs {
-    Limit { market: String, qty: String, price: String },
-    Market { market: String, qty: String },
+    Limit {
+        market: String,
+        qty: String,
+        price: String,
+    },
+    Market {
+        market: String,
+        qty: String,
+    },
 }
 
-fn parse_order_input(
-    args: &str,
-    state: &BotState,
-) -> Result<ParsedOrderArgs, BotError> {
+fn parse_order_input(args: &str, state: &BotState) -> Result<ParsedOrderArgs, BotError> {
     let parts: Vec<&str> = args.split_whitespace().collect();
     match parts.as_slice() {
         [market_arg, qty, price] => {
@@ -3225,11 +3839,23 @@ fn parse_order_input(
 }
 
 fn format_order_result(r: &crate::trading::OrderResult) -> String {
-    let side_emoji = if r.side.to_lowercase().contains("buy") { "📈" } else { "📉" };
-    let is_limit = r.price != "Market";
-    let is_pending = is_limit && r.fills.is_empty() && r.success;
+    let side_emoji = if r.side.to_lowercase().contains("buy") {
+        "📈"
+    } else {
+        "📉"
+    };
+    let is_market = r.side.to_lowercase().contains("market");
+    let not_filled = is_market
+        && r.fills.is_empty()
+        && r.error_msg
+            .as_deref()
+            .map(crate::trading::order_was_not_filled)
+            .unwrap_or(r.success);
+    let is_pending = !is_market && r.fills.is_empty() && r.success;
 
-    let title = if is_pending {
+    let title = if not_filled {
+        format!("⚠️ {side_emoji} *{} Order not filled*", r.side)
+    } else if is_pending {
         format!("⏳ {side_emoji} *{} Limit Order Placed (Pending)*", r.side)
     } else if r.success {
         format!("✅ {side_emoji} *{} Order*", r.side)
@@ -3245,9 +3871,7 @@ fn format_order_result(r: &crate::trading::OrderResult) -> String {
          • Size: `{}`\n\
          • Price: `${}`\n\
          • Client ID: `{}`",
-        r.quantity,
-        r.price,
-        r.client_order_id,
+        r.quantity, r.price, r.client_order_id,
     );
 
     if let Some(ref oid) = r.order_id {
@@ -3261,11 +3885,7 @@ fn format_order_result(r: &crate::trading::OrderResult) -> String {
     if !r.fills.is_empty() {
         text.push_str("\n\n*Fills:*");
         for f in &r.fills {
-            text.push_str(&format!(
-                "\n• qty `{}` @ `${}`",
-                f.quantity,
-                f.price
-            ));
+            text.push_str(&format!("\n• qty `{}` @ `${}`", f.quantity, f.price));
         }
     }
 
