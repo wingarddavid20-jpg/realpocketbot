@@ -749,12 +749,21 @@ async fn show_balance_view(
 
     match state.trading.get_user_balance(&account_id, indexer_id.as_deref()).await {
         Ok(bal) => {
+            let spendable = bal.spendable_margin();
+            let locked_line = if bal.margin_allocated_orders > 0.009 {
+                format!(
+                    "\n• Locked in orders: *${}*",
+                    format_usd(bal.margin_allocated_orders)
+                )
+            } else {
+                String::new()
+            };
             let text = format!(
                 "💰 *Balance*\n\n\
                  • Total Equity: *${}*\n\
-                 • Available Margin: *${}*",
+                 • Available Margin: *${}*{locked_line}",
                 format_usd(bal.total_equity),
-                format_usd(bal.available_margin),
+                format_usd(spendable),
             );
             edit_or_send(bot, chat_id, message_id, &text, back_to_main_keyboard()).await?;
         }
@@ -1507,7 +1516,7 @@ async fn start_trade_from_button(
         None => None,
     };
     let bal_line = match bal_info {
-        Some(ref b) => format!("\n• Available Margin: *${:.2}*", b.available_margin),
+        Some(ref b) => format!("\n• Available Margin: *${:.2}*", b.spendable_margin()),
         None => String::new(),
     };
 
@@ -1555,7 +1564,18 @@ async fn handle_order_size_percentage(
         }
     };
 
-    if bal.available_margin <= 0.0 {
+    let spendable = bal.spendable_margin();
+    info!(
+        user_id,
+        pct,
+        equity = bal.total_equity,
+        available_balance = bal.available_margin,
+        order_margin = bal.margin_allocated_orders,
+        position_margin = bal.margin_allocated_positions,
+        spendable,
+        "sizing percentage from spendable margin"
+    );
+    if spendable <= 0.0 {
         bot.send_message(
             chat_id,
             "❌ Available margin is $0.00. Please deposit funds or enter a custom USD amount (e.g. 50):",
@@ -1565,21 +1585,13 @@ async fn handle_order_size_percentage(
         return Ok(());
     }
 
-    let (usd, is_max_pct) = if pct >= 99.0 {
-        // Reserve 10% (minimum $0.50) buffer for exchange taker fees, book spread, and 1% trading bound
-        let safe = if bal.available_margin > 1.0 {
-            (bal.available_margin - 0.50).min(bal.available_margin * 0.90)
-        } else {
-            bal.available_margin * 0.80
-        };
-        (((safe * 100.0).floor()) / 100.0, true)
-    } else {
-        (((bal.available_margin * (pct / 100.0) * 100.0).floor()) / 100.0, false)
-    };
+    // 100% sizes against free margin (equity minus margin locked in positions and
+    // resting orders), then keeps the 10% / $0.50 fee buffer. Same helper as the typed path.
+    let (usd, is_max_pct) = crate::trading::margin_budget_for_percentage(spendable, pct);
     if usd <= 0.0 {
         bot.send_message(
             chat_id,
-            format!("❌ Calculated size from {pct:.0}% is too small (available: ${:.2}). Please enter a USD amount:", bal.available_margin),
+            format!("❌ Calculated size from {pct:.0}% is too small (available: ${:.2}). Please enter a USD amount:", spendable),
         )
         .reply_markup(order_size_keyboard(None))
         .await?;
@@ -1594,13 +1606,13 @@ async fn handle_order_size_percentage(
         format!(
             "Selected: *${usd:.2}* (100% max with fee reserve from ${:.2})\n\n\
              What leverage? (Up to *{max_lev:.0}x* — choose or type):",
-            bal.available_margin
+            spendable
         )
     } else {
         format!(
             "Selected: *${usd:.2}* ({pct:.0}% of available ${:.2})\n\n\
              What leverage? (Up to *{max_lev:.0}x* — choose or type):",
-            bal.available_margin
+            spendable
         )
     };
     bot.send_message(chat_id, prompt_text)
@@ -1752,15 +1764,21 @@ async fn execute_button_close(
         }
     };
 
-    let decimals = crate::trading::get_cached_market_decimals(&sym_upper);
-    let min_size = crate::trading::get_cached_market_lot_size(&sym_upper);
-    let close_fraction = (pct / 100.0).clamp(0.01, 1.0);
-    let raw_close_qty = if pct >= 99.9 { pos.size } else { pos.size * close_fraction };
-    let (mut qty_str, rounded_close_qty) = crate::trading::round_qty_to_decimals(raw_close_qty, decimals);
-    if rounded_close_qty <= 0.0 && pos.size > 0.0 {
-        let (fallback_str, _) = crate::trading::round_qty_to_decimals(pos.size.min(min_size), decimals);
-        qty_str = fallback_str;
-    }
+    let decimals = crate::trading::get_cached_market_decimals(&market_id);
+    // Floor, never round up. Rounding 100% of a size that is not an exact lot
+    // (0.00325 at 4 decimals → 0.0033) is rejected as ReduceOnlyOrderExceedsPosition.
+    let qty_str = match crate::trading::format_close_qty(pos.size, pct, decimals) {
+        Some((qty, floored)) if floored > 0.0 => qty,
+        _ => {
+            let text = format!(
+                "❌ *Close size is below the minimum lot*\n\n\
+                 Position size `{:.8}` {sym_upper} does not leave a whole lot after flooring to {decimals} decimals.",
+                pos.size
+            );
+            edit_or_send(bot, chat_id, message_id, &text, back_to_main_keyboard()).await?;
+            return Ok(());
+        }
+    };
 
     let is_pos_long = pos.direction.eq_ignore_ascii_case("long") || pos.direction.eq_ignore_ascii_case("buy");
     let close_side = if is_pos_long { "Sell" } else { "Buy" };
@@ -1784,6 +1802,15 @@ async fn execute_button_close(
 
     match res {
         Ok(order) if order.success => {
+            info!(
+                user_id,
+                market = %sym_upper,
+                order_id = ?order.order_id,
+                client_order_id = %order.client_order_id,
+                quantity = %order.quantity,
+                error = ?order.error_msg,
+                "execute_button_close: order succeeded"
+            );
             let order_id = order.order_id.unwrap_or_else(|| "N/A".into());
             let text = format!(
                 "✅ *Close Order Submitted*\n\n\
@@ -1801,10 +1828,20 @@ async fn execute_button_close(
         }
         Ok(order) => {
             let err = order.error_msg.unwrap_or_else(|| "Engine rejected order".into());
+            error!(
+                user_id,
+                market = %sym_upper,
+                order_id = ?order.order_id,
+                client_order_id = %order.client_order_id,
+                quantity = %order.quantity,
+                error = %err,
+                "execute_button_close: order rejected"
+            );
             let text = format!("❌ *Close Order Rejected*\n\nReason: {err}");
             edit_or_send(bot, chat_id, message_id, &text, back_to_main_keyboard()).await?;
         }
         Err(e) => {
+            error!(user_id, market = %sym_upper, error = %e, "execute_button_close: order failed");
             let text = format!("❌ *Failed to submit close order*\n\n{e}");
             edit_or_send(bot, chat_id, message_id, &text, back_to_main_keyboard()).await?;
         }
@@ -1858,7 +1895,7 @@ async fn handle_trade_step(
                 None => None,
             };
             let bal_line = match bal_info {
-                Some(ref b) => format!("\n• Available Margin: *${:.2}*", b.available_margin),
+                Some(ref b) => format!("\n• Available Margin: *${:.2}*", b.spendable_margin()),
                 None => String::new(),
             };
 
@@ -1910,7 +1947,18 @@ async fn handle_trade_step(
                     }
                 };
 
-                if bal.available_margin <= 0.0 {
+                let spendable = bal.spendable_margin();
+                info!(
+                    user_id,
+                    pct,
+                    equity = bal.total_equity,
+                    available_balance = bal.available_margin,
+                    order_margin = bal.margin_allocated_orders,
+                    position_margin = bal.margin_allocated_positions,
+                    spendable,
+                    "sizing typed percentage from spendable margin"
+                );
+                if spendable <= 0.0 {
                     bot.send_message(
                         chat_id,
                         "❌ Available margin is $0.00. Please deposit funds or enter a custom USD amount (e.g. 50):",
@@ -1920,21 +1968,12 @@ async fn handle_trade_step(
                     return Ok(());
                 }
 
-                let (calc_usd, is_max) = if pct >= 99.0 {
-                    let safe = if bal.available_margin > 1.0 {
-                        (bal.available_margin - 0.50).min(bal.available_margin * 0.90)
-                    } else {
-                        bal.available_margin * 0.80
-                    };
-                    ((((safe * 100.0).floor()) / 100.0).max(0.0), true)
-                } else {
-                    (((bal.available_margin * (pct / 100.0) * 100.0).floor()) / 100.0, false)
-                };
+                let (calc_usd, is_max) = crate::trading::margin_budget_for_percentage(spendable, pct);
 
                 if calc_usd <= 0.0 {
                     bot.send_message(
                         chat_id,
-                        format!("❌ Calculated size from {pct:.0}% is too small (available: ${:.2}). Please enter a USD amount:", bal.available_margin),
+                        format!("❌ Calculated size from {pct:.0}% is too small (available: ${:.2}). Please enter a USD amount:", spendable),
                     )
                     .reply_markup(order_size_keyboard(None))
                     .await?;
@@ -1964,18 +2003,14 @@ async fn handle_trade_step(
                 };
 
                 if let Some(bal) = bal_opt {
-                    let safe = if bal.available_margin > 1.0 {
-                        (bal.available_margin - 0.50).min(bal.available_margin * 0.90)
-                    } else {
-                        bal.available_margin * 0.80
-                    };
-                    let max_safe = (((safe * 100.0).floor()) / 100.0).max(0.0);
-                    if val > bal.available_margin {
+                    let spendable = bal.spendable_margin();
+                    let max_safe = crate::trading::max_margin_budget(spendable);
+                    if val > spendable {
                         bot.send_message(
                             chat_id,
                             format!(
                                 "❌ Amount *${val:.2}* exceeds your available margin (*${:.2}*). Please enter an amount up to *${max_safe:.2}*:",
-                                bal.available_margin
+                                spendable
                             ),
                         )
                         .reply_markup(order_size_keyboard(None))
@@ -2312,10 +2347,12 @@ async fn execute_conversational_trade(
     //    - Limit Sell is placed above mark price. Sizing against max(limit_price, mark_price) * 1.01
     //      (which is limit_price * 1.01) reserves a safe margin buffer for order collateral.
     // 2. For Market orders (both Long and Short):
-    //    Crossing the spread into the orderbook incurs taker fees (0.06%), spread slippage,
-    //    and Real.xyz's 1% trading bound slippage check.
-    //    Buffer mark_price by 1.5% so the resulting base asset quantity never causes
-    //    the required margin + slippage bounds to exceed the user's allocated margin.
+    //    Quantity is sized against mark * 1.015 (above the mark) so a fill inside the
+    //    1% trading bound, plus fees, still fits in the USD budget.
+    //    The order itself is an IOC limit at a side-correct protective price
+    //    (long: above the mark, short: below). That price is NOT the sizing price:
+    //    sizing a short at the lower cap would increase quantity and can demand
+    //    more margin than is free.
     let exec_price = if let Some(p) = limit_price {
         p.max(mark_price) * 1.01
     } else {
@@ -2342,13 +2379,17 @@ async fn execute_conversational_trade(
         TradeDirection::Short => ("Short", "📉"),
     };
 
-    let price_str = match (order_type, limit_price) {
-        (crate::bot::state::OrderTypeChoice::Limit, Some(p)) => {
+    let price_str = match (order_type, limit_price, direction) {
+        (crate::bot::state::OrderTypeChoice::Limit, Some(p), _) => {
             crate::trading::sanitize_order_price_for_market(market_id, &p.to_string()).0
         }
-        _ => {
+        (_, _, TradeDirection::Long) => {
             let price_decimals = crate::trading::get_cached_market_price_decimals(market_id);
-            crate::trading::round_price_to_decimals(mark_price, price_decimals).0
+            crate::trading::protective_slippage_price(mark_price, true, price_decimals).0
+        }
+        (_, _, TradeDirection::Short) => {
+            let price_decimals = crate::trading::get_cached_market_price_decimals(market_id);
+            crate::trading::protective_slippage_price(mark_price, false, price_decimals).0
         }
     };
 
@@ -2359,10 +2400,13 @@ async fn execute_conversational_trade(
         direction = %dir_str,
         order_type = ?order_type,
         limit_price = ?limit_price,
+        mark_price = mark_price,
         exec_price = exec_price,
         raw_qty = raw_qty,
         qty_str = %qty_str,
         price_str = %price_str,
+        usd_amount = usd_amount,
+        leverage = leverage,
         "execute_conversational_trade: placing order"
     );
 
@@ -2386,10 +2430,10 @@ async fn execute_conversational_trade(
     // The position remains open until the user manually triggers a close.
     let res = match (direction, order_type) {
         (TradeDirection::Long, crate::bot::state::OrderTypeChoice::Market) => {
-            state.trading.place_user_market_long(&user.account_id, &decrypted, market_id, &qty_str).await
+            state.trading.place_user_market_long(&user.account_id, &decrypted, market_id, &qty_str, Some(&price_str)).await
         }
         (TradeDirection::Short, crate::bot::state::OrderTypeChoice::Market) => {
-            state.trading.place_user_market_short(&user.account_id, &decrypted, market_id, &qty_str).await
+            state.trading.place_user_market_short(&user.account_id, &decrypted, market_id, &qty_str, Some(&price_str)).await
         }
         (TradeDirection::Long, crate::bot::state::OrderTypeChoice::Limit) => {
             state.trading.place_user_limit_long(&user.account_id, &decrypted, market_id, &qty_str, &price_str).await
@@ -2403,6 +2447,16 @@ async fn execute_conversational_trade(
 
     match res {
         Ok(order) if order.success => {
+            info!(
+                user_id,
+                market = %symbol,
+                order_id = ?order.order_id,
+                client_order_id = %order.client_order_id,
+                quantity = %order.quantity,
+                price = %order.price,
+                fills = order.fills.len(),
+                "execute_conversational_trade: order succeeded"
+            );
             let order_id = order.order_id.unwrap_or_else(|| "N/A".into());
             let is_limit = matches!(order_type, crate::bot::state::OrderTypeChoice::Limit);
             let is_pending = is_limit && order.fills.is_empty();
@@ -2479,6 +2533,16 @@ async fn execute_conversational_trade(
         }
         Ok(order) => {
             let err = order.error_msg.unwrap_or_else(|| "Engine rejected order".into());
+            error!(
+                user_id,
+                market = %symbol,
+                order_id = ?order.order_id,
+                client_order_id = %order.client_order_id,
+                quantity = %order.quantity,
+                price = %order.price,
+                error = %err,
+                "execute_conversational_trade: order rejected"
+            );
             bot.send_message(
                 chat_id,
                 format!("❌ *Order Rejected*\n\nReason: {err}"),
@@ -2488,6 +2552,12 @@ async fn execute_conversational_trade(
             .await?;
         }
         Err(e) => {
+            error!(
+                user_id,
+                market = %symbol,
+                error = %e,
+                "execute_conversational_trade: order failed"
+            );
             bot.send_message(
                 chat_id,
                 format!("❌ *Failed to submit order*\n\n{e}"),
@@ -2740,7 +2810,7 @@ async fn cmd_long(
     // The position remains open until the user manually triggers a close.
     let res = match parsed {
         ParsedOrderArgs::Market { ref market, ref qty } => {
-            state.trading.place_user_market_long(&user.account_id, &decrypted, market, qty).await
+            state.trading.place_user_market_long(&user.account_id, &decrypted, market, qty, None).await
         }
         ParsedOrderArgs::Limit { ref market, ref qty, ref price } => {
             state.trading.place_user_limit_long(&user.account_id, &decrypted, market, qty, price).await
@@ -2822,7 +2892,7 @@ async fn cmd_short(
     // The position remains open until the user manually triggers a close.
     let res = match parsed {
         ParsedOrderArgs::Market { ref market, ref qty } => {
-            state.trading.place_user_market_short(&user.account_id, &decrypted, market, qty).await
+            state.trading.place_user_market_short(&user.account_id, &decrypted, market, qty, None).await
         }
         ParsedOrderArgs::Limit { ref market, ref qty, ref price } => {
             state.trading.place_user_limit_short(&user.account_id, &decrypted, market, qty, price).await
@@ -2925,15 +2995,24 @@ async fn cmd_close(
         }
     };
 
-    let decimals = crate::trading::get_cached_market_decimals(&symbol);
-    let min_size = crate::trading::get_cached_market_lot_size(&symbol);
-    let close_fraction = (percentage / 100.0).clamp(0.01, 1.0);
-    let raw_close_qty = if percentage >= 99.9 { pos.size } else { pos.size * close_fraction };
-    let (mut qty_str, rounded_close_qty) = crate::trading::round_qty_to_decimals(raw_close_qty, decimals);
-    if rounded_close_qty <= 0.0 && pos.size > 0.0 {
-        let (fallback_str, _) = crate::trading::round_qty_to_decimals(pos.size.min(min_size), decimals);
-        qty_str = fallback_str;
-    }
+    let decimals = crate::trading::get_cached_market_decimals(&market_id);
+    let qty_str = match crate::trading::format_close_qty(pos.size, percentage, decimals) {
+        Some((qty, floored)) if floored > 0.0 => qty,
+        _ => {
+            bot.send_message(
+                chat_id,
+                format!(
+                    "❌ *Close size is below the minimum lot*\n\n\
+                     Position size `{:.8}` {symbol} does not leave a whole lot after flooring to {decimals} decimals.",
+                    pos.size
+                ),
+            )
+            .reply_markup(back_to_main_keyboard())
+            .parse_mode(ParseMode::Markdown)
+            .await?;
+            return Ok(());
+        }
+    };
 
     let is_pos_long = pos.direction.eq_ignore_ascii_case("long") || pos.direction.eq_ignore_ascii_case("buy");
     let close_side = if is_pos_long { "Sell" } else { "Buy" };
@@ -2961,6 +3040,14 @@ async fn cmd_close(
 
     match res {
         Ok(order) if order.success => {
+            info!(
+                user_id,
+                market = %symbol,
+                order_id = ?order.order_id,
+                client_order_id = %order.client_order_id,
+                quantity = %order.quantity,
+                "cmd_close: order succeeded"
+            );
             let order_id = order.order_id.unwrap_or_else(|| "N/A".into());
             let price_desc = match manual_price {
                 Some(ref p) => format!("Limit @ `${p}`"),
@@ -2985,6 +3072,15 @@ async fn cmd_close(
         }
         Ok(order) => {
             let err = order.error_msg.unwrap_or_else(|| "Engine rejected order".into());
+            error!(
+                user_id,
+                market = %symbol,
+                order_id = ?order.order_id,
+                client_order_id = %order.client_order_id,
+                quantity = %order.quantity,
+                error = %err,
+                "cmd_close: order rejected"
+            );
             bot.send_message(
                 chat_id,
                 format!("❌ *Close Order Rejected*\n\nReason: {err}"),
@@ -2994,6 +3090,7 @@ async fn cmd_close(
             .await?;
         }
         Err(e) => {
+            error!(user_id, market = %symbol, error = %e, "cmd_close: order failed");
             bot.send_message(
                 chat_id,
                 format!("❌ *Failed to submit close order*\n\n{e}"),
