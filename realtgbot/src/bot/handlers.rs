@@ -2304,14 +2304,22 @@ async fn execute_conversational_trade(
         }
     }
 
-    let is_market_buy = matches!(order_type, crate::bot::state::OrderTypeChoice::Market)
-        && matches!(direction, TradeDirection::Long);
+    // Sizing price calculation:
+    // 1. For Limit orders (both Long and Short):
+    //    - Limit Buy is placed below mark price. Evaluating at limit price would make raw_qty
+    //      larger than at mark price, exceeding available margin when validated by the engine.
+    //      Therefore, we size against max(limit_price, mark_price) * 1.01.
+    //    - Limit Sell is placed above mark price. Sizing against max(limit_price, mark_price) * 1.01
+    //      (which is limit_price * 1.01) reserves a safe margin buffer for order collateral.
+    // 2. For Market orders (both Long and Short):
+    //    Crossing the spread into the orderbook incurs taker fees (0.06%), spread slippage,
+    //    and Real.xyz's 1% trading bound slippage check.
+    //    Buffer mark_price by 1.5% so the resulting base asset quantity never causes
+    //    the required margin + slippage bounds to exceed the user's allocated margin.
     let exec_price = if let Some(p) = limit_price {
-        p
-    } else if is_market_buy {
-        mark_price * 1.01
+        p.max(mark_price) * 1.01
     } else {
-        mark_price
+        mark_price * 1.015
     };
     let total_notional = usd_amount * leverage;
     let raw_qty = total_notional / exec_price;
@@ -2398,6 +2406,7 @@ async fn execute_conversational_trade(
             let order_id = order.order_id.unwrap_or_else(|| "N/A".into());
             let is_limit = matches!(order_type, crate::bot::state::OrderTypeChoice::Limit);
             let is_pending = is_limit && order.fills.is_empty();
+            let final_qty = if !order.quantity.is_empty() { &order.quantity } else { &qty_str };
 
             if is_pending {
                 let p = limit_price.unwrap_or(exec_price);
@@ -2406,7 +2415,7 @@ async fn execute_conversational_trade(
                      • Market: *{symbol}*\n\
                      • Limit Price: *${}*\n\
                      • Mark Price: *${}*\n\
-                     • Size: `{qty_str}` {symbol}\n\
+                     • Size: `{final_qty}` {symbol}\n\
                      • Margin: *${:.2}* ({:.0}x)\n\
                      • Value: *${}*\n\
                      • Order ID: `{order_id}`\n\n\
@@ -2453,7 +2462,7 @@ async fn execute_conversational_trade(
                      • Margin: *${:.2}*\n\
                      • Leverage: *{:.0}x*\n\
                      • Value: *${}*\n\
-                     • Size: `{qty_str}` {symbol}\n\
+                     • Size: `{final_qty}` {symbol}\n\
                      {}\n\
                      • Order ID: `{order_id}`\
                      {fill_summary}",

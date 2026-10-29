@@ -2226,6 +2226,41 @@ impl TradingClient {
             }
         }
 
+        if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
+            if let Ok(val) = clean_qty.parse::<f64>() {
+                for reduction in [0.90, 0.80] {
+                    let reduced_val = val * reduction;
+                    let (retry_qty, floored) = floor_qty_to_decimals(reduced_val, decimals);
+                    if floored > 0.0 && retry_qty != clean_qty {
+                        info!(market = %market, old_qty = %clean_qty, retry_qty = %retry_qty, reduction = %reduction, "Retrying market buy after InsufficientMargin");
+                        let retry_coid = Uuid::new_v4().to_string();
+                        if let Ok(retry_order) = SubmitOrderRequest::builder()
+                            .market(market)
+                            .account(&account_id)
+                            .buy()
+                            .market_order()
+                            .quantity(&retry_qty)
+                            .immediate_or_cancel()
+                            .client_order_id(&retry_coid)
+                            .build()
+                        {
+                            let retry_req = Uuid::new_v4().to_string();
+                            let client = self.client.lock().await;
+                            if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                                drop(client);
+                                if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy (Market)", &retry_qty, "Market", market, &retry_coid) {
+                                    res = retry_res;
+                                    if res.success {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(res)
     }
 
@@ -2279,6 +2314,41 @@ impl TradingClient {
                         drop(client);
                         if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell (Market)", &retry_qty, "Market", market, &retry_coid) {
                             res = retry_res;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
+            if let Ok(val) = clean_qty.parse::<f64>() {
+                for reduction in [0.90, 0.80] {
+                    let reduced_val = val * reduction;
+                    let (retry_qty, floored) = floor_qty_to_decimals(reduced_val, decimals);
+                    if floored > 0.0 && retry_qty != clean_qty {
+                        info!(market = %market, old_qty = %clean_qty, retry_qty = %retry_qty, reduction = %reduction, "Retrying market sell after InsufficientMargin");
+                        let retry_coid = Uuid::new_v4().to_string();
+                        if let Ok(retry_order) = SubmitOrderRequest::builder()
+                            .market(market)
+                            .account(&account_id)
+                            .sell()
+                            .market_order()
+                            .quantity(&retry_qty)
+                            .immediate_or_cancel()
+                            .client_order_id(&retry_coid)
+                            .build()
+                        {
+                            let retry_req = Uuid::new_v4().to_string();
+                            let client = self.client.lock().await;
+                            if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                                drop(client);
+                                if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell (Market)", &retry_qty, "Market", market, &retry_coid) {
+                                    res = retry_res;
+                                    if res.success {
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2523,6 +2593,42 @@ impl TradingClient {
             }
         }
 
+        if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
+            if let Ok(val) = clean_qty.parse::<f64>() {
+                for reduction in [0.90, 0.80] {
+                    let reduced_val = val * reduction;
+                    let (retry_qty, floored) = floor_qty_to_decimals(reduced_val, decimals);
+                    if floored > 0.0 && retry_qty != clean_qty {
+                        info!(market = %market, old_qty = %clean_qty, retry_qty = %retry_qty, reduction = %reduction, "Retrying limit buy after InsufficientMargin");
+                        let retry_coid = Uuid::new_v4().to_string();
+                        if let Ok(retry_order) = SubmitOrderRequest::builder()
+                            .market(market)
+                            .account(&account_id)
+                            .buy()
+                            .limit_order(&clean_price)
+                            .quantity(&retry_qty)
+                            .post_only(true)
+                            .good_till_cancel()
+                            .client_order_id(&retry_coid)
+                            .build()
+                        {
+                            let retry_req = Uuid::new_v4().to_string();
+                            let client = self.client.lock().await;
+                            if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                                drop(client);
+                                if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy", &retry_qty, &clean_price, market, &retry_coid) {
+                                    res = retry_res;
+                                    if res.success {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(res)
     }
 
@@ -2638,6 +2744,42 @@ impl TradingClient {
                         drop(client);
                         if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &retry_qty, &clean_price, market, &retry_coid) {
                             res = retry_res;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
+            if let Ok(val) = clean_qty.parse::<f64>() {
+                for reduction in [0.90, 0.80] {
+                    let reduced_val = val * reduction;
+                    let (retry_qty, floored) = floor_qty_to_decimals(reduced_val, decimals);
+                    if floored > 0.0 && retry_qty != clean_qty {
+                        info!(market = %market, old_qty = %clean_qty, retry_qty = %retry_qty, reduction = %reduction, "Retrying limit sell after InsufficientMargin");
+                        let retry_coid = Uuid::new_v4().to_string();
+                        if let Ok(retry_order) = SubmitOrderRequest::builder()
+                            .market(market)
+                            .account(&account_id)
+                            .sell()
+                            .limit_order(&clean_price)
+                            .quantity(&retry_qty)
+                            .post_only(true)
+                            .good_till_cancel()
+                            .client_order_id(&retry_coid)
+                            .build()
+                        {
+                            let retry_req = Uuid::new_v4().to_string();
+                            let client = self.client.lock().await;
+                            if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                                drop(client);
+                                if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &retry_qty, &clean_price, market, &retry_coid) {
+                                    res = retry_res;
+                                    if res.success {
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2760,25 +2902,30 @@ impl TradingClient {
 
         if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
             if let Ok(val) = clean_qty.parse::<f64>() {
-                let reduced_val = val * 0.90;
-                let (retry_qty, floored) = floor_qty_to_decimals(reduced_val, decimals);
-                if floored > 0.0 && retry_qty != clean_qty {
-                    info!(market = %market, old_qty = %clean_qty, retry_qty = %retry_qty, "Retrying user market buy with 10% reduced size after InsufficientMargin");
-                    let retry_coid = Uuid::new_v4().to_string();
-                    if let Ok(retry_order) = SubmitOrderRequest::builder()
-                        .market(market)
-                        .account(account_id)
-                        .buy()
-                        .market_order()
-                        .quantity(&retry_qty)
-                        .immediate_or_cancel()
-                        .client_order_id(&retry_coid)
-                        .build()
-                    {
-                        let retry_req = Uuid::new_v4().to_string();
-                        if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
-                            if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy (Market)", &retry_qty, "Market", market, &retry_coid) {
-                                res = retry_res;
+                for reduction in [0.90, 0.80] {
+                    let reduced_val = val * reduction;
+                    let (retry_qty, floored) = floor_qty_to_decimals(reduced_val, decimals);
+                    if floored > 0.0 && retry_qty != clean_qty {
+                        info!(market = %market, old_qty = %clean_qty, retry_qty = %retry_qty, reduction = %reduction, "Retrying user market buy after InsufficientMargin");
+                        let retry_coid = Uuid::new_v4().to_string();
+                        if let Ok(retry_order) = SubmitOrderRequest::builder()
+                            .market(market)
+                            .account(account_id)
+                            .buy()
+                            .market_order()
+                            .quantity(&retry_qty)
+                            .immediate_or_cancel()
+                            .client_order_id(&retry_coid)
+                            .build()
+                        {
+                            let retry_req = Uuid::new_v4().to_string();
+                            if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                                if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy (Market)", &retry_qty, "Market", market, &retry_coid) {
+                                    res = retry_res;
+                                    if res.success {
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -2844,25 +2991,30 @@ impl TradingClient {
 
         if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
             if let Ok(val) = clean_qty.parse::<f64>() {
-                let reduced_val = val * 0.90;
-                let (retry_qty, floored) = floor_qty_to_decimals(reduced_val, decimals);
-                if floored > 0.0 && retry_qty != clean_qty {
-                    info!(market = %market, old_qty = %clean_qty, retry_qty = %retry_qty, "Retrying user market sell with 10% reduced size after InsufficientMargin");
-                    let retry_coid = Uuid::new_v4().to_string();
-                    if let Ok(retry_order) = SubmitOrderRequest::builder()
-                        .market(market)
-                        .account(account_id)
-                        .sell()
-                        .market_order()
-                        .quantity(&retry_qty)
-                        .immediate_or_cancel()
-                        .client_order_id(&retry_coid)
-                        .build()
-                    {
-                        let retry_req = Uuid::new_v4().to_string();
-                        if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
-                            if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell (Market)", &retry_qty, "Market", market, &retry_coid) {
-                                res = retry_res;
+                for reduction in [0.90, 0.80] {
+                    let reduced_val = val * reduction;
+                    let (retry_qty, floored) = floor_qty_to_decimals(reduced_val, decimals);
+                    if floored > 0.0 && retry_qty != clean_qty {
+                        info!(market = %market, old_qty = %clean_qty, retry_qty = %retry_qty, reduction = %reduction, "Retrying user market sell after InsufficientMargin");
+                        let retry_coid = Uuid::new_v4().to_string();
+                        if let Ok(retry_order) = SubmitOrderRequest::builder()
+                            .market(market)
+                            .account(account_id)
+                            .sell()
+                            .market_order()
+                            .quantity(&retry_qty)
+                            .immediate_or_cancel()
+                            .client_order_id(&retry_coid)
+                            .build()
+                        {
+                            let retry_req = Uuid::new_v4().to_string();
+                            if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                                if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell (Market)", &retry_qty, "Market", market, &retry_coid) {
+                                    res = retry_res;
+                                    if res.success {
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -2987,6 +3139,40 @@ impl TradingClient {
             }
         }
 
+        if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
+            if let Ok(val) = clean_qty.parse::<f64>() {
+                for reduction in [0.90, 0.80] {
+                    let reduced_val = val * reduction;
+                    let (retry_qty, floored) = floor_qty_to_decimals(reduced_val, decimals);
+                    if floored > 0.0 && retry_qty != clean_qty {
+                        info!(market = %market, old_qty = %clean_qty, retry_qty = %retry_qty, reduction = %reduction, "Retrying user limit buy after InsufficientMargin");
+                        let retry_coid = Uuid::new_v4().to_string();
+                        if let Ok(retry_order) = SubmitOrderRequest::builder()
+                            .market(market)
+                            .account(account_id)
+                            .buy()
+                            .limit_order(&clean_price)
+                            .quantity(&retry_qty)
+                            .post_only(true)
+                            .good_till_cancel()
+                            .client_order_id(&retry_coid)
+                            .build()
+                        {
+                            let retry_req = Uuid::new_v4().to_string();
+                            if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                                if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy", &retry_qty, &clean_price, market, &retry_coid) {
+                                    res = retry_res;
+                                    if res.success {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(res)
     }
 
@@ -3098,6 +3284,40 @@ impl TradingClient {
                     if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
                         if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &retry_qty, &clean_price, market, &retry_coid) {
                             res = retry_res;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
+            if let Ok(val) = clean_qty.parse::<f64>() {
+                for reduction in [0.90, 0.80] {
+                    let reduced_val = val * reduction;
+                    let (retry_qty, floored) = floor_qty_to_decimals(reduced_val, decimals);
+                    if floored > 0.0 && retry_qty != clean_qty {
+                        info!(market = %market, old_qty = %clean_qty, retry_qty = %retry_qty, reduction = %reduction, "Retrying user limit sell after InsufficientMargin");
+                        let retry_coid = Uuid::new_v4().to_string();
+                        if let Ok(retry_order) = SubmitOrderRequest::builder()
+                            .market(market)
+                            .account(account_id)
+                            .sell()
+                            .limit_order(&clean_price)
+                            .quantity(&retry_qty)
+                            .post_only(true)
+                            .good_till_cancel()
+                            .client_order_id(&retry_coid)
+                            .build()
+                        {
+                            let retry_req = Uuid::new_v4().to_string();
+                            if let Ok(retry_rep) = client.submit_order(retry_order, Some(retry_req)).await {
+                                if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &retry_qty, &clean_price, market, &retry_coid) {
+                                    res = retry_res;
+                                    if res.success {
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
