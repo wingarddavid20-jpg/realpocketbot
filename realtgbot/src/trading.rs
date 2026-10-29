@@ -4,19 +4,19 @@
 //! async methods for every bot command. Handlers in `bot/` call only these
 //! methods and never touch the SDK types directly.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use sdk::{
-    SigningClient,
     crypto::{RawSigner, Signer},
     types::{
-        CancelOrderRequest, OrderType, OrdersTerminated, Report, SubmitOrderRequest,
+        CancelOrderRequest, OrderStatus, OrderType, Report, SubmitOrderRequest, TimeInForce,
         TradeExecuted, TransactionReport,
     },
+    SigningClient,
 };
 
 use crate::{
@@ -455,45 +455,192 @@ pub fn ceil_price_to_decimals(price: f64, decimals: usize) -> (String, f64) {
     (formatted, ceiled)
 }
 
-/// Stay inside Real.xyz's 1% trading bound (`trading_bound = 0.01` on every listed perp).
-/// A cap of 1.5% is rejected with PriceBoundStopped, so the order price uses 0.9%.
-const MARKET_PROTECTIVE_OFFSET: f64 = 0.009;
+/// Extra room past the price level that covers the order, so a small book move still fills.
+const DEPTH_PRICE_BUFFER: f64 = 0.0015;
+/// Used when `/depth` is missing. Tight on purpose: a wide cap is charged as extra margin.
+const FALLBACK_MARK_OFFSET: f64 = 0.003;
+/// Default taker fee when the indexer payload has not been loaded yet (BTC/ETH live schedule).
+const DEFAULT_TAKER_FEE: f64 = 0.00019;
+const DEFAULT_TRADING_BOUND: f64 = 0.01;
 
-/// Protective IOC price for a marketable order.
+/// One price level from `/api/v1/markets/{id}/depth`.
+#[derive(Debug, Clone, Copy)]
+pub struct BookLevel {
+    pub price: f64,
+    pub qty: f64,
+}
+
+/// Cached risk schedule for one market, used by sizing and the protective price.
+#[derive(Debug, Clone, Copy)]
+pub struct MarketRiskParams {
+    pub imr: f64,
+    pub taker_fee: f64,
+    pub trading_bound: f64,
+    pub lot_size: f64,
+    pub qty_decimals: usize,
+    pub price_decimals: usize,
+}
+
+/// Quote produced by [`TradingClient::resolve_marketable_qty`].
+#[derive(Debug, Clone)]
+pub struct MarketableQuote {
+    pub quantity: String,
+    pub quantity_f: f64,
+    pub price: String,
+    pub price_f: f64,
+    pub mark: f64,
+}
+
+/// Initial-margin rate actually used for sizing.
 ///
-/// A buy (market long, or buying to close a short) is capped *above* the mark.
-/// A sell (market short, or selling to close a long) is floored *below* the mark.
-/// Rounding is toward the mark, then nudged one tick if that lands on the wrong side.
-pub fn protective_slippage_price(mark: f64, is_buy: bool, price_decimals: usize) -> (String, f64) {
+/// The caller's leverage cannot exceed `1/imr`. A 100x request on a 40x market
+/// (imr 0.025) stays at 0.025; a 10x request uses 0.10.
+pub fn capped_imr(market_imr: f64, leverage: f64) -> f64 {
+    let market_imr = if market_imr > 0.0 { market_imr } else { 0.05 };
+    if leverage > 0.0 {
+        (1.0 / leverage).max(market_imr)
+    } else {
+        market_imr
+    }
+}
+
+/// Margin the engine reserves per one unit of base.
+///
+/// Buys above the mark pay `max(0, P - mark)` on top of initial margin and the
+/// taker fee. Sells below the mark pay `max(0, mark - P)`.
+pub fn marketable_margin_per_unit(
+    price: f64,
+    mark: f64,
+    is_buy: bool,
+    imr: f64,
+    taker_fee: f64,
+) -> f64 {
+    if !(price > 0.0) {
+        return 0.0;
+    }
+    let slippage = if is_buy {
+        (price - mark).max(0.0)
+    } else {
+        (mark - price).max(0.0)
+    };
+    price * imr.max(0.0) + price * taker_fee.max(0.0) + slippage
+}
+
+/// Floor `qty` to a whole number of lots, then to the market's decimal scale.
+pub fn floor_qty_to_lot(qty: f64, lot_size: f64, decimals: usize) -> (String, f64) {
+    if !(qty > 0.0) {
+        return floor_qty_to_decimals(0.0, decimals);
+    }
+    let stepped = if lot_size > 0.0 {
+        let steps = ((qty / lot_size) + 1e-8).floor();
+        (steps * lot_size).max(0.0)
+    } else {
+        qty
+    };
+    floor_qty_to_decimals(stepped, decimals)
+}
+
+/// Largest lot-aligned quantity whose margin fits in `budget`.
+///
+/// `qty = budget / (P*imr + P*taker_fee + slippage)`, where slippage is
+/// `max(0, P-mark)` for a buy and `max(0, mark-P)` for a sell.
+pub fn size_marketable_qty(
+    budget: f64,
+    price: f64,
+    mark: f64,
+    is_buy: bool,
+    imr: f64,
+    taker_fee: f64,
+    lot_size: f64,
+    decimals: usize,
+) -> (String, f64) {
+    let per_unit = marketable_margin_per_unit(price, mark, is_buy, imr, taker_fee);
+    if !(budget > 0.0) || !(per_unit > 0.0) {
+        return floor_qty_to_decimals(0.0, decimals);
+    }
+    floor_qty_to_lot(budget / per_unit, lot_size, decimals)
+}
+
+/// Protective IOC price.
+///
+/// Walks `levels` (asks for a buy, bids for a sell) until `qty` is covered,
+/// adds a 0.15% buffer, and caps the result strictly inside `trading_bound`.
+/// An empty book falls back to mark ± 0.3%.
+pub fn protective_slippage_price(
+    mark: f64,
+    is_buy: bool,
+    price_decimals: usize,
+    levels: &[BookLevel],
+    qty: f64,
+    trading_bound: f64,
+) -> (String, f64) {
     if !(mark > 0.0) {
         return ("0".to_string(), 0.0);
     }
-    let raw = if is_buy {
-        mark * (1.0 + MARKET_PROTECTIVE_OFFSET)
-    } else {
-        mark * (1.0 - MARKET_PROTECTIVE_OFFSET)
-    };
-    let (mut formatted, mut value) = if is_buy {
-        floor_price_to_decimals(raw, price_decimals)
-    } else {
-        ceil_price_to_decimals(raw, price_decimals)
-    };
-    if value <= 0.0 {
-        return (formatted, value);
+    let mut book: Vec<BookLevel> = levels
+        .iter()
+        .copied()
+        .filter(|lvl| lvl.price > 0.0 && lvl.qty > 0.0)
+        .collect();
+    book.sort_by(|a, b| {
+        if is_buy {
+            a.price
+                .partial_cmp(&b.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        } else {
+            b.price
+                .partial_cmp(&a.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
+    });
+
+    let mut covered = 0.0;
+    let mut cover_price = None;
+    for lvl in &book {
+        covered += lvl.qty;
+        cover_price = Some(lvl.price);
+        if !(qty > 0.0) || covered + 1e-12 >= qty {
+            break;
+        }
     }
+
+    let raw = match cover_price {
+        Some(px) if is_buy => px * (1.0 + DEPTH_PRICE_BUFFER),
+        Some(px) => px * (1.0 - DEPTH_PRICE_BUFFER),
+        None if is_buy => mark * (1.0 + FALLBACK_MARK_OFFSET),
+        None => mark * (1.0 - FALLBACK_MARK_OFFSET),
+    };
+
+    let bound = if trading_bound > 0.0 && trading_bound < 1.0 {
+        trading_bound
+    } else {
+        DEFAULT_TRADING_BOUND
+    };
     let step = 10_f64.powi(-(price_decimals as i32));
-    if is_buy && value <= mark {
-        let bumped = value + step;
-        if bumped < mark * 1.01 {
-            value = bumped;
-            formatted = format!("{:.prec$}", value, prec = price_decimals);
-        }
-    } else if !is_buy && value >= mark {
-        let dropped = value - step;
-        if dropped > 0.0 {
-            value = dropped;
-            formatted = format!("{:.prec$}", value, prec = price_decimals);
-        }
+    let max_buy = (mark * (1.0 + bound) - step).max(mark);
+    let min_sell = (mark * (1.0 - bound) + step).max(step);
+    let clamped = if is_buy {
+        raw.min(max_buy).max(step)
+    } else {
+        raw.max(min_sell).max(step)
+    };
+
+    let (mut formatted, mut value) = if is_buy {
+        ceil_price_to_decimals(clamped, price_decimals)
+    } else {
+        floor_price_to_decimals(clamped, price_decimals)
+    };
+    if is_buy && value > max_buy + 1e-9 {
+        let (floored, floored_val) = floor_price_to_decimals(max_buy, price_decimals);
+        formatted = floored;
+        value = floored_val;
+    } else if !is_buy && value + 1e-9 < min_sell {
+        let (ceiled, ceiled_val) = ceil_price_to_decimals(min_sell, price_decimals);
+        formatted = ceiled;
+        value = ceiled_val;
+    }
+    if value <= 0.0 {
+        return ("0".to_string(), 0.0);
     }
     (formatted, value)
 }
@@ -613,7 +760,11 @@ pub fn is_decimal_precision_error(err_str: &str) -> bool {
 }
 
 /// Compute one fewer decimal place for retry upon receiving Error 121.
-pub fn next_fewer_decimal_qty(market: &str, current_qty: &str, current_decimals: usize) -> Option<(String, usize)> {
+pub fn next_fewer_decimal_qty(
+    market: &str,
+    current_qty: &str,
+    current_decimals: usize,
+) -> Option<(String, usize)> {
     if current_decimals == 0 {
         return None;
     }
@@ -688,14 +839,25 @@ pub fn next_fewer_decimal_price(
 
 // ─── Public data shapes returned to handlers ─────────────────────────────────
 
+#[derive(Debug, Clone, Copy)]
+struct ParsedMarketRules {
+    qty_decimals: usize,
+    lot_size: f64,
+    price_decimals: usize,
+    max_leverage: f64,
+    imr: f64,
+    taker_fee: f64,
+    trading_bound: f64,
+}
+
 /// Information on a live market loaded dynamically from Real.xyz indexer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketInfo {
     pub market_id: String,
-    pub symbol: String,        // e.g. "BTC-USDT"
-    pub base_asset: String,    // e.g. "BTC"
-    pub quote_asset: String,   // e.g. "USDT"
-    pub short_name: String,    // e.g. "btc"
+    pub symbol: String,      // e.g. "BTC-USDT"
+    pub base_asset: String,  // e.g. "BTC"
+    pub quote_asset: String, // e.g. "USDT"
+    pub short_name: String,  // e.g. "btc"
     pub mark_price: f64,
     pub index_price: f64,
     pub last_traded_price: Option<f64>,
@@ -714,6 +876,15 @@ pub struct MarketInfo {
     pub price_decimals: usize,
     #[serde(default = "default_market_max_leverage")]
     pub max_leverage: f64,
+    /// Initial margin rate (`risk_engine.imr`). Leverage cannot exceed `1/imr`.
+    #[serde(default = "default_market_imr")]
+    pub imr: f64,
+    /// Taker fee rate charged on notional (`fees.taker_rates[0]`).
+    #[serde(default = "default_market_taker_fee")]
+    pub taker_fee: f64,
+    /// Max distance from the mark the engine will accept (`order_rules.trading_bound`).
+    #[serde(default = "default_market_trading_bound")]
+    pub trading_bound: f64,
 }
 
 fn default_market_qty_decimals() -> usize {
@@ -730,6 +901,18 @@ fn default_market_price_decimals() -> usize {
 
 fn default_market_max_leverage() -> f64 {
     20.0
+}
+
+fn default_market_imr() -> f64 {
+    0.05
+}
+
+fn default_market_taker_fee() -> f64 {
+    DEFAULT_TAKER_FEE
+}
+
+fn default_market_trading_bound() -> f64 {
+    DEFAULT_TRADING_BOUND
 }
 
 #[derive(Debug, Clone)]
@@ -760,6 +943,9 @@ pub fn fallback_markets() -> Vec<MarketInfo> {
             lot_size: 0.0001,
             price_decimals: 1,
             max_leverage: 40.0,
+            imr: 0.025,
+            taker_fee: DEFAULT_TAKER_FEE,
+            trading_bound: DEFAULT_TRADING_BOUND,
         },
         MarketInfo {
             market_id: ETH_MARKET.to_string(),
@@ -781,6 +967,9 @@ pub fn fallback_markets() -> Vec<MarketInfo> {
             lot_size: 0.001,
             price_decimals: 2,
             max_leverage: 25.0,
+            imr: 0.04,
+            taker_fee: DEFAULT_TAKER_FEE,
+            trading_bound: DEFAULT_TRADING_BOUND,
         },
         MarketInfo {
             market_id: SOL_MARKET.to_string(),
@@ -802,6 +991,9 @@ pub fn fallback_markets() -> Vec<MarketInfo> {
             lot_size: 0.01,
             price_decimals: 3,
             max_leverage: 20.0,
+            imr: 0.05,
+            taker_fee: DEFAULT_TAKER_FEE,
+            trading_bound: DEFAULT_TRADING_BOUND,
         },
         MarketInfo {
             market_id: HYPE_MARKET.to_string(),
@@ -823,6 +1015,9 @@ pub fn fallback_markets() -> Vec<MarketInfo> {
             lot_size: 0.01,
             price_decimals: 3,
             max_leverage: 20.0,
+            imr: 0.05,
+            taker_fee: DEFAULT_TAKER_FEE,
+            trading_bound: DEFAULT_TRADING_BOUND,
         },
         MarketInfo {
             market_id: XAUT_MARKET.to_string(),
@@ -844,6 +1039,9 @@ pub fn fallback_markets() -> Vec<MarketInfo> {
             lot_size: 0.001,
             price_decimals: 2,
             max_leverage: 20.0,
+            imr: 0.05,
+            taker_fee: DEFAULT_TAKER_FEE,
+            trading_bound: DEFAULT_TRADING_BOUND,
         },
     ]
 }
@@ -1023,6 +1221,317 @@ pub fn derive_address_from_key(key: &str) -> BotResult<String> {
         .map_err(|e| BotError::Trading(format!("Invalid private key: {e}")))
 }
 
+/// Indexer view of one order, keyed by `client_order_id`.
+#[derive(Debug, Clone)]
+struct IndexerOrderSnap {
+    status: String,
+    error: Option<String>,
+    filled_qty: String,
+    filled_qty_f: f64,
+    avg_price: String,
+    order_id: String,
+}
+
+pub fn order_was_not_filled(err: &str) -> bool {
+    is_not_filled_message(err)
+}
+
+fn is_not_filled_message(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.starts_with("not filled") || lower.contains("did not trade") || lower.contains("no fill")
+}
+
+fn indexer_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "filled"
+            | "cancelled"
+            | "canceled"
+            | "expired"
+            | "killed"
+            | "rejected"
+            | "liquidationcancelled"
+            | "closed"
+    )
+}
+
+fn json_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    } else if let Some(n) = value.as_i64() {
+        Some(n.to_string())
+    } else if let Some(n) = value.as_u64() {
+        Some(n.to_string())
+    } else if value.is_object() {
+        value
+            .get("message")
+            .or_else(|| value.get("code"))
+            .or_else(|| value.get("error"))
+            .and_then(json_text)
+            .or_else(|| Some(value.to_string()))
+    } else {
+        None
+    }
+}
+
+fn order_matches_client_id(order: &serde_json::Value, client_order_id: &str) -> bool {
+    let raw = order
+        .get("client_order_id")
+        .or_else(|| order.get("ci"))
+        .and_then(json_text);
+    match raw {
+        Some(id) => id.eq_ignore_ascii_case(client_order_id),
+        None => false,
+    }
+}
+
+/// Pull the order with `client_order_id` out of an indexer orders payload.
+fn indexer_order_from_json(
+    val: &serde_json::Value,
+    client_order_id: &str,
+) -> Option<IndexerOrderSnap> {
+    let orders = val
+        .get("data")
+        .and_then(|d| d.as_array())
+        .or_else(|| val.as_array())
+        .or_else(|| val.get("orders").and_then(|o| o.as_array()))?;
+    let order = if orders.len() == 1 {
+        orders.first()?
+    } else {
+        orders
+            .iter()
+            .find(|o| order_matches_client_id(o, client_order_id))?
+    };
+    // A one-element page is only ours when the id matches or the field is absent
+    // (some payloads echo the filter without repeating the id).
+    if orders.len() == 1 && !order_matches_client_id(order, client_order_id) {
+        let echoed = order
+            .get("client_order_id")
+            .or_else(|| order.get("ci"))
+            .and_then(json_text);
+        if echoed.is_some() {
+            return None;
+        }
+    }
+    let status = order
+        .get("status")
+        .or_else(|| order.get("st"))
+        .and_then(json_text)
+        .unwrap_or_else(|| "Active".to_string());
+    let error = order
+        .get("error")
+        .or_else(|| order.get("er"))
+        .and_then(json_text);
+    let filled_qty = order
+        .get("filled_quantity")
+        .or_else(|| order.get("fq"))
+        .or_else(|| order.get("filled_size"))
+        .and_then(json_text)
+        .unwrap_or_else(|| "0".to_string());
+    let filled_qty_f = filled_qty.parse::<f64>().unwrap_or(0.0);
+    let avg_price = order
+        .get("average_filled_price")
+        .or_else(|| order.get("afp"))
+        .or_else(|| order.get("price"))
+        .or_else(|| order.get("p"))
+        .and_then(json_text)
+        .unwrap_or_default();
+    let order_id = order
+        .get("id")
+        .or_else(|| order.get("i"))
+        .or_else(|| order.get("order_id"))
+        .and_then(json_text)
+        .unwrap_or_default();
+    Some(IndexerOrderSnap {
+        status,
+        error,
+        filled_qty,
+        filled_qty_f,
+        avg_price,
+        order_id,
+    })
+}
+
+/// Fold an indexer snapshot into the submit result.
+///
+/// Rejected (and an IOC/FOK that ends with no fill) becomes `success = false`
+/// so the existing InsufficientMargin / decimal retries can run. A positive
+/// fill is copied onto the result when the receipt itself had none.
+fn apply_indexer_confirmation(res: &mut OrderResult, snap: &IndexerOrderSnap, immediate: bool) {
+    if !snap.order_id.is_empty() && res.order_id.is_none() {
+        res.order_id = Some(snap.order_id.clone());
+    }
+    if snap.filled_qty_f > 0.0 && res.fills.is_empty() {
+        let price = if snap.avg_price.is_empty() {
+            res.price.clone()
+        } else {
+            snap.avg_price.clone()
+        };
+        res.fills.push(FillInfo {
+            trade_id: if snap.order_id.is_empty() {
+                res.client_order_id.clone()
+            } else {
+                snap.order_id.clone()
+            },
+            price,
+            quantity: snap.filled_qty.clone(),
+        });
+    }
+
+    let status = snap.status.to_ascii_lowercase();
+    let rejected = status == "rejected" || status == "killed";
+    let cancelled_empty = matches!(
+        status.as_str(),
+        "cancelled" | "canceled" | "expired" | "liquidationcancelled" | "closed"
+    ) && snap.filled_qty_f <= 0.0;
+    if rejected || (immediate && cancelled_empty) {
+        res.success = false;
+        res.fills.clear();
+        res.error_msg = snap
+            .error
+            .clone()
+            .filter(|err| !err.is_empty())
+            .or_else(|| {
+                if rejected {
+                    Some(snap.status.clone())
+                } else {
+                    Some(format!("Not filled ({})", snap.status))
+                }
+            });
+        return;
+    }
+    if status == "filled" || snap.filled_qty_f > 0.0 {
+        res.success = true;
+        res.error_msg = None;
+    }
+}
+
+fn interpret_submit_report(
+    report: &TransactionReport,
+    side: &str,
+    quantity: &str,
+    price: &str,
+    market: &str,
+    client_order_id: &str,
+) -> (OrderResult, bool, Option<String>) {
+    if !report.success {
+        let err_msg = report
+            .errors
+            .as_ref()
+            .map(|map| {
+                map.values()
+                    .map(|e| format!("{:?}", e))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .unwrap_or_else(|| "unknown error".into());
+        warn!("Order transaction rejected: {err_msg}");
+        let res = OrderResult {
+            success: false,
+            order_id: None,
+            client_order_id: client_order_id.to_string(),
+            side: side.to_string(),
+            quantity: quantity.to_string(),
+            price: price.to_string(),
+            market: market.to_string(),
+            error_msg: Some(err_msg),
+            fills: vec![],
+        };
+        return (res, false, None);
+    }
+
+    for receipt in &report.receipts {
+        if let Report::SubmitOrderReport { order, trades } = receipt {
+            let mut fills: Vec<FillInfo> = trades
+                .iter()
+                .map(|t: &TradeExecuted| FillInfo {
+                    trade_id: t.id.to_string(),
+                    price: t.price.to_string(),
+                    quantity: t.volume.to_string(),
+                })
+                .collect();
+            if fills.is_empty() && decimal_is_positive(&order.filled_quantity.to_string()) {
+                fills.push(FillInfo {
+                    trade_id: order.id.to_string(),
+                    price: order
+                        .price
+                        .as_ref()
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| price.to_string()),
+                    quantity: order.filled_quantity.to_string(),
+                });
+            }
+
+            let immediate = matches!(order.tif, TimeInForce::Ioc | TimeInForce::Fok);
+            let status_rejected =
+                matches!(order.status, OrderStatus::Rejected | OrderStatus::Killed);
+            let unfilled_immediate = immediate
+                && fills.is_empty()
+                && matches!(
+                    order.status,
+                    OrderStatus::Cancelled
+                        | OrderStatus::Expired
+                        | OrderStatus::Killed
+                        | OrderStatus::Rejected
+                        | OrderStatus::LiquidationCancelled
+                );
+            let error_msg = order.error.as_ref().map(|e| format!("{e:?}")).or_else(|| {
+                if status_rejected {
+                    Some(format!("{:?}", order.status))
+                } else if unfilled_immediate {
+                    Some(format!("Not filled ({:?})", order.status))
+                } else {
+                    None
+                }
+            });
+            let success = error_msg.is_none();
+            if !success {
+                warn!(
+                    client_order_id,
+                    status = ?order.status,
+                    error = ?error_msg,
+                    "order receipt was not an acceptance"
+                );
+            }
+            let res = OrderResult {
+                success,
+                order_id: Some(order.id.to_string()),
+                client_order_id: client_order_id.to_string(),
+                side: side.to_string(),
+                quantity: quantity.to_string(),
+                price: price.to_string(),
+                market: market.to_string(),
+                error_msg,
+                fills,
+            };
+            return (res, immediate, Some(order.account.to_string()));
+        }
+    }
+
+    warn!("No SubmitOrderReport receipt in successful transaction");
+    let res = OrderResult {
+        success: report.success,
+        order_id: None,
+        client_order_id: client_order_id.to_string(),
+        side: side.to_string(),
+        quantity: quantity.to_string(),
+        price: price.to_string(),
+        market: market.to_string(),
+        error_msg: None,
+        fills: vec![],
+    };
+    (res, false, None)
+}
+
+fn decimal_is_positive(raw: &str) -> bool {
+    raw.parse::<f64>().unwrap_or(0.0) > 0.0
+}
+
 fn log_order_outcome(res: &OrderResult) {
     if res.success {
         info!(
@@ -1130,24 +1639,42 @@ impl TradingClient {
     pub async fn fetch_markets_from_indexer(&self) -> BotResult<Vec<MarketInfo>> {
         // Fetch live order rules from /api/v1/markets to extract size_decimal_places, lot_size & price_decimal_places
         let markets_url = format!("{}/api/v1/markets", self.config.network.indexer_url());
-        let mut rules_map: HashMap<String, (usize, f64, usize, f64)> = HashMap::new();
+        let mut rules_map: HashMap<String, ParsedMarketRules> = HashMap::new();
         if let Ok(resp) = self.http.get(&markets_url).send().await {
             if let Ok(val) = resp.json::<serde_json::Value>().await {
                 if let Some(arr) = val.get("data").and_then(|d| d.as_array()) {
                     for m in arr {
-                        let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-                        let sym = m.get("symbol").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                        let id = m
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        let sym = m
+                            .get("symbol")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_lowercase();
                         let base = sym.split(['-', '/']).next().unwrap_or("").to_string();
                         let rules = m.get("order_rules");
                         let dec = rules
                             .and_then(|r| r.get("size_decimal_places"))
-                            .and_then(|v| v.as_str().and_then(|s| s.parse::<usize>().ok()).or_else(|| v.as_u64().map(|n| n as usize)));
-                        let lot = rules
-                            .and_then(|r| r.get("lot_size"))
-                            .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()));
+                            .and_then(|v| {
+                                v.as_str()
+                                    .and_then(|s| s.parse::<usize>().ok())
+                                    .or_else(|| v.as_u64().map(|n| n as usize))
+                            });
+                        let lot = rules.and_then(|r| r.get("lot_size")).and_then(|v| {
+                            v.as_str()
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .or_else(|| v.as_f64())
+                        });
                         let price_dec = rules
                             .and_then(|r| r.get("price_decimal_places"))
-                            .and_then(|v| v.as_str().and_then(|s| s.parse::<usize>().ok()).or_else(|| v.as_u64().map(|n| n as usize)))
+                            .and_then(|v| {
+                                v.as_str()
+                                    .and_then(|s| s.parse::<usize>().ok())
+                                    .or_else(|| v.as_u64().map(|n| n as usize))
+                            })
                             .or_else(|| {
                                 rules.and_then(|r| r.get("tick_size")).and_then(|v| {
                                     if let Some(s) = v.as_str() {
@@ -1158,7 +1685,9 @@ impl TradingClient {
                                         if f > 0.0 && f < 1.0 {
                                             let s = format!("{:.8}", f);
                                             if let Some(pos) = s.find('.') {
-                                                return Some(s[pos + 1..].trim_end_matches('0').len());
+                                                return Some(
+                                                    s[pos + 1..].trim_end_matches('0').len(),
+                                                );
                                             }
                                         }
                                     }
@@ -1167,7 +1696,8 @@ impl TradingClient {
                             })
                             .unwrap_or_else(|| fallback_price_decimals(&base));
 
-                        let max_lev = m.get("risk_engine")
+                        let max_lev = m
+                            .get("risk_engine")
                             .and_then(|re| re.get("max_leverage"))
                             .and_then(|v| {
                                 if let Some(s) = v.as_str() {
@@ -1190,19 +1720,63 @@ impl TradingClient {
                                             None
                                         }
                                     })
-                                    .and_then(|imr| if imr > 0.0 { Some((1.0 / imr).round()) } else { None })
+                                    .and_then(|imr| {
+                                        if imr > 0.0 {
+                                            Some((1.0 / imr).round())
+                                        } else {
+                                            None
+                                        }
+                                    })
                             })
                             .unwrap_or_else(|| fallback_max_leverage(&base));
 
+                        let imr = m
+                            .get("risk_engine")
+                            .and_then(|re| re.get("imr"))
+                            .and_then(json_f64)
+                            .filter(|v| *v > 0.0)
+                            .unwrap_or_else(|| {
+                                if max_lev > 0.0 {
+                                    1.0 / max_lev
+                                } else {
+                                    default_market_imr()
+                                }
+                            });
+                        let taker_fee = m
+                            .get("fees")
+                            .and_then(|fees| fees.get("taker_rates"))
+                            .and_then(|rates| {
+                                rates
+                                    .as_array()
+                                    .and_then(|arr| arr.iter().find_map(json_f64))
+                                    .or_else(|| json_f64(rates))
+                            })
+                            .filter(|v| *v >= 0.0)
+                            .unwrap_or(DEFAULT_TAKER_FEE);
+                        let trading_bound = rules
+                            .and_then(|r| r.get("trading_bound"))
+                            .and_then(json_f64)
+                            .filter(|v| *v > 0.0 && *v < 1.0)
+                            .unwrap_or(DEFAULT_TRADING_BOUND);
+
                         if let (Some(d), Some(l)) = (dec, lot) {
+                            let parsed = ParsedMarketRules {
+                                qty_decimals: d,
+                                lot_size: l,
+                                price_decimals: price_dec,
+                                max_leverage: max_lev,
+                                imr,
+                                taker_fee,
+                                trading_bound,
+                            };
                             if !id.is_empty() {
-                                rules_map.insert(id, (d, l, price_dec, max_lev));
+                                rules_map.insert(id, parsed);
                             }
                             if !sym.is_empty() {
-                                rules_map.insert(sym.clone(), (d, l, price_dec, max_lev));
+                                rules_map.insert(sym.clone(), parsed);
                             }
                             if !base.is_empty() {
-                                rules_map.insert(base, (d, l, price_dec, max_lev));
+                                rules_map.insert(base, parsed);
                             }
                         }
                     }
@@ -1210,14 +1784,24 @@ impl TradingClient {
             }
         }
 
-        let url = format!("{}/api/v1/markets/tickers", self.config.network.indexer_url());
-        let resp = self.http.get(&url).send().await
+        let url = format!(
+            "{}/api/v1/markets/tickers",
+            self.config.network.indexer_url()
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
             .map_err(|e| BotError::Trading(format!("Failed to fetch markets: {e}")))?;
 
-        let val = resp.json::<serde_json::Value>().await
+        let val = resp
+            .json::<serde_json::Value>()
+            .await
             .map_err(|e| BotError::Trading(format!("Failed to parse markets JSON: {e}")))?;
 
-        let items = val.get("data")
+        let items = val
+            .get("data")
             .and_then(|d| d.as_array())
             .ok_or_else(|| BotError::Trading("Invalid markets data array from indexer".into()))?;
 
@@ -1228,7 +1812,8 @@ impl TradingClient {
                 _ => continue,
             };
 
-            let symbol = item.get("symbol")
+            let symbol = item
+                .get("symbol")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -1238,73 +1823,102 @@ impl TradingClient {
             }
 
             let parts: Vec<&str> = symbol.split(|c| c == '-' || c == '/').collect();
-            let base_asset = parts.first().unwrap_or(&symbol.as_str()).trim().to_uppercase();
+            let base_asset = parts
+                .first()
+                .unwrap_or(&symbol.as_str())
+                .trim()
+                .to_uppercase();
             let quote_asset = parts.get(1).unwrap_or(&"USDT").trim().to_uppercase();
             let short_name = base_asset.to_lowercase();
 
-            let mark_price = item.get("mark_price")
+            let mark_price = item
+                .get("mark_price")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<f64>().ok())
                 .or_else(|| item.get("mark_price").and_then(|v| v.as_f64()))
                 .unwrap_or(0.0);
 
-            let index_price = item.get("index_price")
+            let index_price = item
+                .get("index_price")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<f64>().ok())
                 .or_else(|| item.get("index_price").and_then(|v| v.as_f64()))
                 .unwrap_or(mark_price);
 
-            let last_traded_price = item.get("last_traded_price")
+            let last_traded_price = item
+                .get("last_traded_price")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<f64>().ok())
                 .or_else(|| item.get("last_traded_price").and_then(|v| v.as_f64()));
 
-            let price_change_24h = item.get("price_change_24h")
+            let price_change_24h = item
+                .get("price_change_24h")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<f64>().ok())
                 .or_else(|| item.get("price_change_24h").and_then(|v| v.as_f64()));
 
-            let high_price_24h = item.get("high_price_24h")
+            let high_price_24h = item
+                .get("high_price_24h")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<f64>().ok())
                 .or_else(|| item.get("high_price_24h").and_then(|v| v.as_f64()));
 
-            let low_price_24h = item.get("low_price_24h")
+            let low_price_24h = item
+                .get("low_price_24h")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<f64>().ok())
                 .or_else(|| item.get("low_price_24h").and_then(|v| v.as_f64()));
 
-            let volume_24h = item.get("volume_24h")
+            let volume_24h = item
+                .get("volume_24h")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<f64>().ok())
                 .or_else(|| item.get("volume_24h").and_then(|v| v.as_f64()));
 
-            let turnover_24h = item.get("turnover_24h")
+            let turnover_24h = item
+                .get("turnover_24h")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<f64>().ok())
                 .or_else(|| item.get("turnover_24h").and_then(|v| v.as_f64()));
 
-            let perp_next_funding_rate = item.get("perp_next_funding_rate")
+            let perp_next_funding_rate = item
+                .get("perp_next_funding_rate")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<f64>().ok())
                 .or_else(|| item.get("perp_next_funding_rate").and_then(|v| v.as_f64()));
 
-            let perp_next_funding_time_ms = item.get("perp_next_funding_time_ms")
+            let perp_next_funding_time_ms = item
+                .get("perp_next_funding_time_ms")
                 .and_then(|v| v.as_u64());
 
-            let (qty_decimals, lot_size, price_decimals, max_leverage) = if let Some(&(d, l, p, lev)) = rules_map.get(&market_id.to_lowercase())
+            let rules = rules_map
+                .get(&market_id.to_lowercase())
                 .or_else(|| rules_map.get(&symbol.to_lowercase()))
                 .or_else(|| rules_map.get(&base_asset.to_lowercase()))
-            {
-                (d, l, p, lev)
-            } else {
-                (
-                    parse_qty_decimals(item, &base_asset),
-                    fallback_market_lot_size(&base_asset),
-                    fallback_price_decimals(&base_asset),
-                    fallback_max_leverage(&base_asset),
-                )
-            };
+                .copied();
+            let qty_decimals = rules
+                .map(|r| r.qty_decimals)
+                .unwrap_or_else(|| parse_qty_decimals(item, &base_asset));
+            let lot_size = rules
+                .map(|r| r.lot_size)
+                .unwrap_or_else(|| fallback_market_lot_size(&base_asset));
+            let price_decimals = rules
+                .map(|r| r.price_decimals)
+                .unwrap_or_else(|| fallback_price_decimals(&base_asset));
+            let max_leverage = rules
+                .map(|r| r.max_leverage)
+                .unwrap_or_else(|| fallback_max_leverage(&base_asset));
+            let imr = rules.map(|r| r.imr).unwrap_or_else(|| {
+                if max_leverage > 0.0 {
+                    1.0 / max_leverage
+                } else {
+                    default_market_imr()
+                }
+            });
+            let taker_fee = rules.map(|r| r.taker_fee).unwrap_or(DEFAULT_TAKER_FEE);
+            let trading_bound = rules
+                .map(|r| r.trading_bound)
+                .unwrap_or(DEFAULT_TRADING_BOUND);
 
             markets.push(MarketInfo {
                 market_id,
@@ -1326,6 +1940,9 @@ impl TradingClient {
                 lot_size,
                 price_decimals,
                 max_leverage,
+                imr,
+                taker_fee,
+                trading_bound,
             });
         }
 
@@ -1363,7 +1980,10 @@ impl TradingClient {
         // Needs refresh
         match self.fetch_markets_from_indexer().await {
             Ok(fresh_markets) if !fresh_markets.is_empty() => {
-                info!(count = fresh_markets.len(), "Refreshed markets list from Real.xyz indexer");
+                info!(
+                    count = fresh_markets.len(),
+                    "Refreshed markets list from Real.xyz indexer"
+                );
                 update_cached_market_names(&fresh_markets);
                 update_cached_market_decimals(&fresh_markets);
                 update_cached_market_lot_sizes(&fresh_markets);
@@ -1422,9 +2042,9 @@ impl TradingClient {
             "btc" | "btc-usdt" | "btcusdt" => Some(BTC_MARKET.to_string()),
             "eth" | "eth-usdt" | "ethusdt" => Some(ETH_MARKET.to_string()),
             "sol" | "sol-usdt" | "solusdt" => Some(SOL_MARKET.to_string()),
-            "hype" | "hype-usdt" | "hypeusdt" => {
-                Some("0x7fa781f5e1d1da7165cf96e5a6898235f55f2d812dd429d3feed69ff776dfa70".to_string())
-            }
+            "hype" | "hype-usdt" | "hypeusdt" => Some(
+                "0x7fa781f5e1d1da7165cf96e5a6898235f55f2d812dd429d3feed69ff776dfa70".to_string(),
+            ),
             _ => None,
         }
     }
@@ -1453,7 +2073,9 @@ impl TradingClient {
             "ETH".into()
         } else if market_id.eq_ignore_ascii_case(SOL_MARKET) {
             "SOL".into()
-        } else if market_id.eq_ignore_ascii_case("0x7fa781f5e1d1da7165cf96e5a6898235f55f2d812dd429d3feed69ff776dfa70") {
+        } else if market_id.eq_ignore_ascii_case(
+            "0x7fa781f5e1d1da7165cf96e5a6898235f55f2d812dd429d3feed69ff776dfa70",
+        ) {
             "HYPE".into()
         } else if market_id.len() > 10 {
             format!("{}…{}", &market_id[..6], &market_id[market_id.len() - 4..])
@@ -1464,10 +2086,19 @@ impl TradingClient {
 
     /// Lookup Account ID and on-chain trading account object ID by IOTA wallet address.
     pub async fn lookup_account_by_address(&self, address: &str) -> Option<AccountLookup> {
-        let url = format!("{}/api/v1/accounts?f[address]={}", self.config.network.indexer_url(), address);
-        if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(4), self.http.get(&url).send()).await {
+        let url = format!(
+            "{}/api/v1/accounts?f[address]={}",
+            self.config.network.indexer_url(),
+            address
+        );
+        if let Ok(Ok(resp)) =
+            tokio::time::timeout(Duration::from_secs(4), self.http.get(&url).send()).await
+        {
             if let Ok(val) = resp.json::<serde_json::Value>().await {
-                let list_opt = val.get("data").and_then(|d| d.as_array()).or_else(|| val.as_array());
+                let list_opt = val
+                    .get("data")
+                    .and_then(|d| d.as_array())
+                    .or_else(|| val.as_array());
                 if let Some(list) = list_opt {
                     for item in list {
                         if let (Some(addr), Some(oid), Some(id)) = (
@@ -1502,17 +2133,21 @@ impl TradingClient {
             self.config.network.indexer_url(),
             trimmed
         );
-        if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(3), self.http.get(&filtered_url).send()).await {
+        if let Ok(Ok(resp)) =
+            tokio::time::timeout(Duration::from_secs(3), self.http.get(&filtered_url).send()).await
+        {
             if let Ok(val) = resp.json::<serde_json::Value>().await {
-                let list_opt = val.get("data").and_then(|d| d.as_array()).or_else(|| val.as_array());
+                let list_opt = val
+                    .get("data")
+                    .and_then(|d| d.as_array())
+                    .or_else(|| val.as_array());
                 if let Some(list) = list_opt {
                     for item in list {
                         if let (Some(oid), Some(id)) = (
                             item.get("account_object_id").and_then(|o| o.as_str()),
                             item.get("id").and_then(|i| i.as_str()),
                         ) {
-                            if oid.eq_ignore_ascii_case(trimmed)
-                                || id.eq_ignore_ascii_case(trimmed)
+                            if oid.eq_ignore_ascii_case(trimmed) || id.eq_ignore_ascii_case(trimmed)
                             {
                                 return Some(id.to_string());
                             }
@@ -1528,7 +2163,9 @@ impl TradingClient {
             self.config.network.indexer_url(),
             trimmed
         );
-        if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(3), self.http.get(&direct_url).send()).await {
+        if let Ok(Ok(resp)) =
+            tokio::time::timeout(Duration::from_secs(3), self.http.get(&direct_url).send()).await
+        {
             if resp.status().is_success() {
                 if let Ok(val) = resp.json::<serde_json::Value>().await {
                     let acc = val.get("data").unwrap_or(&val);
@@ -1545,9 +2182,14 @@ impl TradingClient {
             self.config.network.indexer_url(),
             trimmed
         );
-        if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(3), self.http.get(&addr_url).send()).await {
+        if let Ok(Ok(resp)) =
+            tokio::time::timeout(Duration::from_secs(3), self.http.get(&addr_url).send()).await
+        {
             if let Ok(val) = resp.json::<serde_json::Value>().await {
-                let list_opt = val.get("data").and_then(|d| d.as_array()).or_else(|| val.as_array());
+                let list_opt = val
+                    .get("data")
+                    .and_then(|d| d.as_array())
+                    .or_else(|| val.as_array());
                 if let Some(list) = list_opt {
                     for item in list {
                         if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
@@ -1626,7 +2268,8 @@ impl TradingClient {
         let available_margin = json_field_f64(data, &["available_balance", "ab"]);
         let margin_allocated_orders = json_field_f64(data, &["margin_allocated_orders", "mao"]);
         let margin_cross = json_field_f64(data, &["margin_allocated_cross_contracts", "macc"]);
-        let margin_isolated = json_field_f64(data, &["margin_allocated_isolated_contracts", "maic"]);
+        let margin_isolated =
+            json_field_f64(data, &["margin_allocated_isolated_contracts", "maic"]);
 
         let balance = BalanceInfo {
             total_equity,
@@ -1732,16 +2375,27 @@ impl TradingClient {
 
     /// Fetch current mark price for a market from the indexer ticker.
     pub async fn get_market_mark_price(&self, market_id: &str) -> BotResult<f64> {
-        let url = format!("{}/api/v1/markets/{}/ticker", self.config.network.indexer_url(), market_id);
-        let resp = self.http.get(&url).send().await
+        let url = format!(
+            "{}/api/v1/markets/{}/ticker",
+            self.config.network.indexer_url(),
+            market_id
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
             .map_err(|e| BotError::Trading(format!("Failed to fetch ticker: {e}")))?;
 
-        let val = resp.json::<serde_json::Value>().await
+        let val = resp
+            .json::<serde_json::Value>()
+            .await
             .map_err(|e| BotError::Trading(format!("Failed to parse ticker: {e}")))?;
 
         let data = val.get("data").unwrap_or(&val);
 
-        let mark_price = data.get("mark_price")
+        let mark_price = data
+            .get("mark_price")
             .or_else(|| data.get("mp"))
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<f64>().ok())
@@ -1757,7 +2411,9 @@ impl TradingClient {
         if mark_price > 0.0 {
             Ok(mark_price)
         } else {
-            Err(BotError::Trading(format!("Price unavailable for market {market_id}")))
+            Err(BotError::Trading(format!(
+                "Price unavailable for market {market_id}"
+            )))
         }
     }
 
@@ -1770,35 +2426,56 @@ impl TradingClient {
     ) -> BotResult<Option<OpenPosition>> {
         let indexer_id = match indexer_id_opt {
             Some(id) if !id.is_empty() => Some(id.to_string()),
-            _ => self.resolve_user_indexer_id(account_id).await.or_else(|| Some(account_id.to_string())),
+            _ => self
+                .resolve_user_indexer_id(account_id)
+                .await
+                .or_else(|| Some(account_id.to_string())),
         };
 
         let base = self.config.network.indexer_url();
         let url = if let Some(ref acc) = indexer_id {
-            format!("{}/api/v1/positions/live?f[account_ids]={}&f[market_ids]={}", base, acc, market_id)
+            format!(
+                "{}/api/v1/positions/live?f[account_ids]={}&f[market_ids]={}",
+                base, acc, market_id
+            )
         } else {
             format!("{}/api/v1/positions/live?f[market_ids]={}", base, market_id)
         };
 
-        let resp = self.http.get(&url).send().await
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
             .map_err(|e| BotError::Trading(format!("Failed to fetch positions: {e}")))?;
 
-        let val = resp.json::<serde_json::Value>().await
+        let val = resp
+            .json::<serde_json::Value>()
+            .await
             .map_err(|e| BotError::Trading(format!("Failed to parse positions: {e}")))?;
 
         if let Some(positions) = val.get("data").and_then(|d| d.as_array()) {
             for p in positions {
-                let status = p.get("status").or_else(|| p.get("st")).and_then(|v| v.as_str()).unwrap_or("");
+                let status = p
+                    .get("status")
+                    .or_else(|| p.get("st"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if status.eq_ignore_ascii_case("closed") {
                     continue;
                 }
 
-                let m_id = p.get("market_id").or_else(|| p.get("m")).and_then(|v| v.as_str()).unwrap_or("");
+                let m_id = p
+                    .get("market_id")
+                    .or_else(|| p.get("m"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if !m_id.is_empty() && !m_id.eq_ignore_ascii_case(market_id) {
                     continue;
                 }
 
-                let size = p.get("size")
+                let size = p
+                    .get("size")
                     .or_else(|| p.get("s"))
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<f64>().ok())
@@ -1809,24 +2486,28 @@ impl TradingClient {
                     continue;
                 }
 
-                let direction = p.get("direction")
+                let direction = p
+                    .get("direction")
                     .or_else(|| p.get("d"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("Long")
                     .to_string();
 
-                let entry_price = p.get("average_entry_price")
+                let entry_price = p
+                    .get("average_entry_price")
                     .or_else(|| p.get("aep"))
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<f64>().ok());
 
-                let mark_price = p.get("live_values")
+                let mark_price = p
+                    .get("live_values")
                     .or_else(|| p.get("pv"))
                     .and_then(|v| v.get("mark_price").or_else(|| v.get("mp")))
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<f64>().ok());
 
-                let is_long = direction.eq_ignore_ascii_case("long") || direction.eq_ignore_ascii_case("buy");
+                let is_long =
+                    direction.eq_ignore_ascii_case("long") || direction.eq_ignore_ascii_case("buy");
                 let notional = mark_price.map(|mp| mp * size).unwrap_or(0.0);
                 let unrealized_pnl = match (entry_price, mark_price) {
                     (Some(ep), Some(mp)) => {
@@ -1867,7 +2548,10 @@ impl TradingClient {
     ) -> BotResult<Vec<OpenPosition>> {
         let indexer_id = match indexer_id_opt {
             Some(id) if !id.is_empty() => Some(id.to_string()),
-            _ => self.resolve_user_indexer_id(account_id).await.or_else(|| Some(account_id.to_string())),
+            _ => self
+                .resolve_user_indexer_id(account_id)
+                .await
+                .or_else(|| Some(account_id.to_string())),
         };
 
         let base = self.config.network.indexer_url();
@@ -1877,26 +2561,42 @@ impl TradingClient {
             format!("{}/api/v1/positions/live", base)
         };
 
-        let resp = self.http.get(&url).send().await
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
             .map_err(|e| BotError::Trading(format!("Failed to fetch positions: {e}")))?;
 
-        let val = resp.json::<serde_json::Value>().await
+        let val = resp
+            .json::<serde_json::Value>()
+            .await
             .map_err(|e| BotError::Trading(format!("Failed to parse positions: {e}")))?;
 
         let mut results = Vec::new();
         if let Some(positions) = val.get("data").and_then(|d| d.as_array()) {
             for p in positions {
-                let status = p.get("status").or_else(|| p.get("st")).and_then(|v| v.as_str()).unwrap_or("");
+                let status = p
+                    .get("status")
+                    .or_else(|| p.get("st"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if status.eq_ignore_ascii_case("closed") {
                     continue;
                 }
 
-                let market_id = p.get("market_id").or_else(|| p.get("m")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let market_id = p
+                    .get("market_id")
+                    .or_else(|| p.get("m"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if market_id.is_empty() {
                     continue;
                 }
 
-                let size = p.get("size")
+                let size = p
+                    .get("size")
                     .or_else(|| p.get("s"))
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<f64>().ok())
@@ -1907,24 +2607,28 @@ impl TradingClient {
                     continue;
                 }
 
-                let direction = p.get("direction")
+                let direction = p
+                    .get("direction")
                     .or_else(|| p.get("d"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("Long")
                     .to_string();
 
-                let entry_price = p.get("average_entry_price")
+                let entry_price = p
+                    .get("average_entry_price")
                     .or_else(|| p.get("aep"))
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<f64>().ok());
 
-                let mark_price = p.get("live_values")
+                let mark_price = p
+                    .get("live_values")
                     .or_else(|| p.get("pv"))
                     .and_then(|v| v.get("mark_price").or_else(|| v.get("mp")))
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<f64>().ok());
 
-                let is_long = direction.eq_ignore_ascii_case("long") || direction.eq_ignore_ascii_case("buy");
+                let is_long =
+                    direction.eq_ignore_ascii_case("long") || direction.eq_ignore_ascii_case("buy");
                 let notional = mark_price.map(|mp| mp * size).unwrap_or(0.0);
                 let unrealized_pnl = match (entry_price, mark_price) {
                     (Some(ep), Some(mp)) => {
@@ -1959,54 +2663,71 @@ impl TradingClient {
 
     /// Fetch comprehensive market statistics including real-time funding rate.
     pub async fn get_market_stats(&self, market_id: &str) -> BotResult<MarketStats> {
-        let url = format!("{}/api/v1/markets/{}/ticker", self.config.network.indexer_url(), market_id);
-        let resp = self.http.get(&url).send().await
+        let url = format!(
+            "{}/api/v1/markets/{}/ticker",
+            self.config.network.indexer_url(),
+            market_id
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
             .map_err(|e| BotError::Trading(format!("Failed to fetch ticker: {e}")))?;
 
-        let val = resp.json::<serde_json::Value>().await
+        let val = resp
+            .json::<serde_json::Value>()
+            .await
             .map_err(|e| BotError::Trading(format!("Failed to parse ticker: {e}")))?;
 
         let data = val.get("data").unwrap_or(&val);
 
-        let mark_price = data.get("mark_price")
+        let mark_price = data
+            .get("mark_price")
             .or_else(|| data.get("mp"))
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<f64>().ok())
             .or_else(|| data.get("mark_price").and_then(|v| v.as_f64()))
             .unwrap_or(0.0);
 
-        let last_price = data.get("last_traded_price")
+        let last_price = data
+            .get("last_traded_price")
             .or_else(|| data.get("ltp"))
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<f64>().ok())
             .or_else(|| data.get("last_traded_price").and_then(|v| v.as_f64()));
 
-        let high_24h = data.get("high_price_24h")
+        let high_24h = data
+            .get("high_price_24h")
             .or_else(|| data.get("hp24h"))
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<f64>().ok())
             .or_else(|| data.get("high_price_24h").and_then(|v| v.as_f64()));
 
-        let low_24h = data.get("low_price_24h")
+        let low_24h = data
+            .get("low_price_24h")
             .or_else(|| data.get("lp24h"))
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<f64>().ok())
             .or_else(|| data.get("low_price_24h").and_then(|v| v.as_f64()));
 
-        let price_change_24h = data.get("price_change_24h")
+        let price_change_24h = data
+            .get("price_change_24h")
             .or_else(|| data.get("pc24h"))
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<f64>().ok())
             .or_else(|| data.get("price_change_24h").and_then(|v| v.as_f64()));
 
-        let funding_rate = data.get("perp_next_funding_rate")
+        let funding_rate = data
+            .get("perp_next_funding_rate")
             .or_else(|| data.get("pnfr"))
             .or_else(|| data.get("funding_rate"))
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<f64>().ok())
             .or_else(|| data.get("perp_next_funding_rate").and_then(|v| v.as_f64()));
 
-        let next_funding_time_ms = data.get("perp_next_funding_time_ms")
+        let next_funding_time_ms = data
+            .get("perp_next_funding_time_ms")
             .or_else(|| data.get("pnft_ms"))
             .and_then(|v| v.as_u64());
 
@@ -2056,33 +2777,48 @@ impl TradingClient {
         let mut list = Vec::new();
         if let Some(fills) = val.get("data").and_then(|d| d.as_array()) {
             for f in fills {
-                let trade_id = f.get("id").or_else(|| f.get("trade_id"))
-                    .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let trade_id = f
+                    .get("id")
+                    .or_else(|| f.get("trade_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
 
                 let market_id = f.get("market_id").and_then(|v| v.as_str()).unwrap_or("");
                 let market_symbol = self.get_market_name(market_id);
 
-                let side = f.get("side").or_else(|| f.get("direction"))
-                    .and_then(|v| v.as_str()).unwrap_or("Trade").to_string();
+                let side = f
+                    .get("side")
+                    .or_else(|| f.get("direction"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Trade")
+                    .to_string();
 
-                let price = f.get("price")
+                let price = f
+                    .get("price")
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<f64>().ok())
                     .unwrap_or(0.0);
 
-                let size = f.get("volume").or_else(|| f.get("size"))
+                let size = f
+                    .get("volume")
+                    .or_else(|| f.get("size"))
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<f64>().ok())
                     .unwrap_or(0.0);
 
-                let notional = if let Some(fv) = f.get("filled_value")
-                    .and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+                let notional = if let Some(fv) = f
+                    .get("filled_value")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                {
                     fv
                 } else {
                     price * size
                 };
 
-                let timestamp = f.get("created_at_epoch_ms")
+                let timestamp = f
+                    .get("created_at_epoch_ms")
                     .or_else(|| f.get("timestamp_ms"))
                     .and_then(|v| v.as_i64())
                     .or_else(|| {
@@ -2114,7 +2850,10 @@ impl TradingClient {
     pub async fn get_all_users_volume(&self, users: &[crate::users::StoredUser]) -> BotResult<f64> {
         let mut total = 0.0;
         for u in users {
-            if let Ok(vol) = self.get_user_volume(&u.account_id, u.indexer_account_id.as_deref()).await {
+            if let Ok(vol) = self
+                .get_user_volume(&u.account_id, u.indexer_account_id.as_deref())
+                .await
+            {
                 total += vol.total;
             }
         }
@@ -2123,7 +2862,8 @@ impl TradingClient {
 
     /// Fetch open position for a given market from the indexer.
     pub async fn get_open_position(&self, market_id: &str) -> BotResult<Option<OpenPosition>> {
-        self.get_user_open_position(&self.config.account_id, None, market_id).await
+        self.get_user_open_position(&self.config.account_id, None, market_id)
+            .await
     }
 
     /// Fetch open orders directly for an indexer ID or account ID.
@@ -2138,28 +2878,30 @@ impl TradingClient {
             id
         );
 
-        let fut = async {
-            let resp = self.http.get(&url).send().await
-                .map_err(|e| BotError::Trading(format!("Failed to connect to indexer: {e}")))?;
+        let fut =
+            async {
+                let resp =
+                    self.http.get(&url).send().await.map_err(|e| {
+                        BotError::Trading(format!("Failed to connect to indexer: {e}"))
+                    })?;
 
-            if resp.status() == reqwest::StatusCode::NOT_FOUND {
-                debug!("Indexer orders endpoint returned 404 for id {id}");
-                return Ok(None);
-            }
+                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                    debug!("Indexer orders endpoint returned 404 for id {id}");
+                    return Ok(None);
+                }
 
-            if !resp.status().is_success() {
-                let status = resp.status();
-                warn!("Indexer orders endpoint returned status {status} for id {id}");
-                return Err(BotError::Trading(format!("Indexer returned status {status}")));
-            }
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    warn!("Indexer orders endpoint returned status {status} for id {id}");
+                    return Err(BotError::Trading(format!(
+                        "Indexer returned status {status}"
+                    )));
+                }
 
-            let val: serde_json::Value = resp
-                .json()
-                .await
-                .unwrap_or(serde_json::Value::Null);
+                let val: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
 
-            Ok(Some(val))
-        };
+                Ok(Some(val))
+            };
 
         let val_opt = match tokio::time::timeout(Duration::from_secs(5), fut).await {
             Ok(Ok(Some(v))) => v,
@@ -2197,7 +2939,8 @@ impl TradingClient {
                 }
 
                 // Extract order_id / id from compact or verbose fields
-                let id_raw = o.get("order_id")
+                let id_raw = o
+                    .get("order_id")
                     .or_else(|| o.get("id"))
                     .or_else(|| o.get("i"))
                     .or_else(|| o.get("oid"))
@@ -2214,9 +2957,13 @@ impl TradingClient {
                     continue;
                 }
 
-                let order_id = order_id_str.parse::<u128>().ok()
+                let order_id = order_id_str
+                    .parse::<u128>()
+                    .ok()
                     .or_else(|| {
-                        let clean = order_id_str.trim_start_matches("0x").trim_start_matches("0X");
+                        let clean = order_id_str
+                            .trim_start_matches("0x")
+                            .trim_start_matches("0X");
                         u128::from_str_radix(clean, 16).ok()
                     })
                     .unwrap_or(0);
@@ -2287,7 +3034,9 @@ impl TradingClient {
                     })
                     .unwrap_or(quantity);
 
-                if remaining_quantity <= 0.0 && (status.eq_ignore_ascii_case("partially_filled") || quantity > 0.0) {
+                if remaining_quantity <= 0.0
+                    && (status.eq_ignore_ascii_case("partially_filled") || quantity > 0.0)
+                {
                     continue;
                 }
 
@@ -2376,7 +3125,10 @@ impl TradingClient {
         let to_resolve = trading_account_obj_id_opt.unwrap_or(acc);
         if !to_resolve.is_empty() {
             if let Some(resolved) = self.resolve_user_indexer_id(to_resolve).await {
-                if !candidate_ids.iter().any(|c| c.eq_ignore_ascii_case(&resolved)) {
+                if !candidate_ids
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&resolved))
+                {
                     if let Ok(Some(orders)) = self.fetch_orders_from_indexer(&resolved).await {
                         return Ok(orders);
                     }
@@ -2390,7 +3142,8 @@ impl TradingClient {
     /// Fetch open orders for default/admin config account.
     pub async fn get_open_orders(&self) -> BotResult<Vec<OpenLimitOrder>> {
         let eff_acc = self.get_effective_account_id().await;
-        self.get_user_open_orders(&eff_acc, Some(&self.config.account_id), Some(&eff_acc)).await
+        self.get_user_open_orders(&eff_acc, Some(&self.config.account_id), Some(&eff_acc))
+            .await
     }
 
     // ─── Public Order Operations ────────────────────────────────────────────
@@ -2405,36 +3158,330 @@ impl TradingClient {
         }
     }
 
-    /// Protective IOC price for a marketable order, on the correct side of the mark.
-    /// Buy: above the mark. Sell: below the mark. `None` if the mark cannot be read;
-    /// the caller then sends an unbounded market order.
-    async fn market_protective_price(&self, market: &str, is_buy: bool) -> Option<String> {
-        match self.get_market_mark_price(market).await {
-            Ok(mark) if mark > 0.0 => {
-                let decimals = get_cached_market_price_decimals(market);
-                let (price, value) = protective_slippage_price(mark, is_buy, decimals);
-                if value > 0.0 {
-                    info!(
-                        market,
-                        is_buy,
-                        mark,
-                        protective = %price,
-                        "computed market protective price"
-                    );
-                    Some(price)
+    /// Risk inputs used by [`size_marketable_qty`]. Falls back to the static
+    /// schedule when the indexer cache has not been filled yet.
+    pub fn market_risk_params(&self, market: &str) -> MarketRiskParams {
+        let markets = self.get_cached_markets();
+        let found = markets.iter().find(|m| {
+            m.market_id.eq_ignore_ascii_case(market)
+                || m.base_asset.eq_ignore_ascii_case(market)
+                || m.short_name.eq_ignore_ascii_case(market)
+                || m.symbol.eq_ignore_ascii_case(market)
+        });
+        if let Some(m) = found {
+            let max_lev = if m.max_leverage > 0.0 {
+                m.max_leverage
+            } else {
+                get_cached_market_max_leverage(market)
+            };
+            MarketRiskParams {
+                imr: if m.imr > 0.0 {
+                    m.imr
+                } else {
+                    1.0 / max_lev.max(1.0)
+                },
+                taker_fee: if m.taker_fee >= 0.0 {
+                    m.taker_fee
+                } else {
+                    DEFAULT_TAKER_FEE
+                },
+                trading_bound: if m.trading_bound > 0.0 {
+                    m.trading_bound
+                } else {
+                    DEFAULT_TRADING_BOUND
+                },
+                lot_size: if m.lot_size > 0.0 {
+                    m.lot_size
+                } else {
+                    get_cached_market_lot_size(market)
+                },
+                qty_decimals: m.qty_decimals,
+                price_decimals: m.price_decimals,
+            }
+        } else {
+            let max_lev = get_cached_market_max_leverage(market).max(1.0);
+            MarketRiskParams {
+                imr: 1.0 / max_lev,
+                taker_fee: DEFAULT_TAKER_FEE,
+                trading_bound: DEFAULT_TRADING_BOUND,
+                lot_size: get_cached_market_lot_size(market),
+                qty_decimals: get_cached_market_decimals(market),
+                price_decimals: get_cached_market_price_decimals(market),
+            }
+        }
+    }
+
+    /// Asks for a buy, bids for a sell. Empty when the book cannot be read.
+    async fn fetch_depth_levels(&self, market: &str, is_buy: bool) -> Vec<BookLevel> {
+        let url = format!(
+            "{}/api/v1/markets/{}/depth",
+            self.config.network.indexer_url(),
+            market
+        );
+        let resp = match self.http.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => resp,
+            Ok(resp) => {
+                warn!(market, status = %resp.status(), "depth endpoint returned a non-success status");
+                return Vec::new();
+            }
+            Err(e) => {
+                warn!(market, error = %e, "depth unavailable; protective price will use the mark fallback");
+                return Vec::new();
+            }
+        };
+        let val = match resp.json::<serde_json::Value>().await {
+            Ok(val) => val,
+            Err(e) => {
+                warn!(market, error = %e, "failed to parse depth payload");
+                return Vec::new();
+            }
+        };
+        let data = val.get("data").unwrap_or(&val);
+        let side_keys: &[&str] = if is_buy {
+            &["sells", "asks", "ask"]
+        } else {
+            &["buys", "bids", "bid"]
+        };
+        let levels = side_keys
+            .iter()
+            .find_map(|key| data.get(*key).and_then(|v| v.as_array()));
+        let Some(levels) = levels else {
+            return Vec::new();
+        };
+        levels
+            .iter()
+            .filter_map(|lvl| {
+                let price = lvl
+                    .get("price_level")
+                    .or_else(|| lvl.get("price"))
+                    .or_else(|| lvl.get("p"))
+                    .and_then(json_f64)
+                    .or_else(|| {
+                        lvl.as_array()
+                            .and_then(|pair| pair.first())
+                            .and_then(json_f64)
+                    })?;
+                let qty = lvl
+                    .get("volume")
+                    .or_else(|| lvl.get("quantity"))
+                    .or_else(|| lvl.get("size"))
+                    .or_else(|| lvl.get("q"))
+                    .and_then(json_f64)
+                    .or_else(|| {
+                        lvl.as_array()
+                            .and_then(|pair| pair.get(1))
+                            .and_then(json_f64)
+                    })?;
+                if price > 0.0 && qty > 0.0 {
+                    Some(BookLevel { price, qty })
                 } else {
                     None
                 }
+            })
+            .collect()
+    }
+
+    /// Size a marketable order against `budget_usd` at `leverage` (capped at `1/imr`).
+    ///
+    /// `qty_cap` is an explicit base-asset size from a slash command. The result
+    /// is the smaller of that cap and the quantity the budget can margin,
+    /// floored to the lot. Price and size are solved together: the book walk
+    /// depends on quantity, and the margin formula depends on that price.
+    pub async fn resolve_marketable_qty(
+        &self,
+        market: &str,
+        is_buy: bool,
+        budget_usd: f64,
+        leverage: f64,
+        qty_cap: Option<f64>,
+    ) -> BotResult<MarketableQuote> {
+        if !(budget_usd > 0.0) {
+            return Err(BotError::Trading(
+                "No margin budget for market order".into(),
+            ));
+        }
+        let _ = self.get_markets().await;
+        let mark = self.get_market_mark_price(market).await?;
+        let params = self.market_risk_params(market);
+        let levels = self.fetch_depth_levels(market, is_buy).await;
+        let imr = capped_imr(params.imr, leverage);
+        let cap = qty_cap.filter(|q| *q > 0.0);
+        let mut qty_guess = cap.unwrap_or_else(|| {
+            if mark > 0.0 && imr > 0.0 {
+                budget_usd / (mark * imr)
+            } else {
+                0.0
             }
-            Ok(_) => None,
+        });
+
+        let mut quote: Option<MarketableQuote> = None;
+        for _ in 0..4 {
+            let (price, price_f) = protective_slippage_price(
+                mark,
+                is_buy,
+                params.price_decimals,
+                &levels,
+                qty_guess,
+                params.trading_bound,
+            );
+            if !(price_f > 0.0) {
+                break;
+            }
+            let (_, sized) = size_marketable_qty(
+                budget_usd,
+                price_f,
+                mark,
+                is_buy,
+                imr,
+                params.taker_fee,
+                params.lot_size,
+                params.qty_decimals,
+            );
+            let capped = cap.map(|limit| sized.min(limit)).unwrap_or(sized);
+            let (quantity, quantity_f) =
+                floor_qty_to_lot(capped, params.lot_size, params.qty_decimals);
+            quote = Some(MarketableQuote {
+                quantity,
+                quantity_f,
+                price,
+                price_f,
+                mark,
+            });
+            if quantity_f <= 0.0 {
+                break;
+            }
+            let settled = (quantity_f - qty_guess).abs() <= params.lot_size.max(1e-12) * 0.5;
+            qty_guess = quantity_f;
+            if settled {
+                break;
+            }
+        }
+
+        match quote {
+            Some(q) if q.quantity_f > 0.0 && q.price_f > 0.0 => {
+                info!(
+                    market,
+                    is_buy,
+                    budget = budget_usd,
+                    leverage,
+                    imr,
+                    mark = q.mark,
+                    price = %q.price,
+                    quantity = %q.quantity,
+                    "resolved marketable order size"
+                );
+                Ok(q)
+            }
+            _ => Err(BotError::Trading(
+                "Order size is below the lot size for the available margin".into(),
+            )),
+        }
+    }
+
+    /// Cap an explicit base quantity to what `account_id` can margin, and pair
+    /// it with a book-walking protective price. Shared by admin
+    /// `place_market_*` and per-user `place_user_market_*`.
+    pub async fn cap_requested_market_qty(
+        &self,
+        account_id: &str,
+        indexer_id: Option<&str>,
+        market: &str,
+        is_buy: bool,
+        requested_qty: &str,
+    ) -> (String, Option<String>) {
+        let requested = requested_qty.parse::<f64>().unwrap_or(0.0);
+        if !(requested > 0.0) {
+            return (requested_qty.to_string(), None);
+        }
+        let budget = match self.get_user_balance(account_id, indexer_id).await {
+            Ok(balance) => balance.spendable_margin(),
+            Err(e) => {
+                warn!(
+                    account_id,
+                    market,
+                    error = %e,
+                    "margin unavailable; submitting the requested market quantity"
+                );
+                let price = self
+                    .market_protective_price(market, is_buy, requested)
+                    .await;
+                return (requested_qty.to_string(), price);
+            }
+        };
+        if !(budget > 0.0) {
+            warn!(
+                account_id,
+                market, "no spendable margin; submitting the requested market quantity"
+            );
+            let price = self
+                .market_protective_price(market, is_buy, requested)
+                .await;
+            return (requested_qty.to_string(), price);
+        }
+        let leverage = self.get_market_max_leverage(market);
+        match self
+            .resolve_marketable_qty(market, is_buy, budget, leverage, Some(requested))
+            .await
+        {
+            Ok(quote) => (quote.quantity, Some(quote.price)),
+            Err(e) => {
+                warn!(
+                    account_id,
+                    market,
+                    error = %e,
+                    "marketable sizing failed; submitting the requested quantity"
+                );
+                let price = self
+                    .market_protective_price(market, is_buy, requested)
+                    .await;
+                (requested_qty.to_string(), price)
+            }
+        }
+    }
+
+    /// Protective IOC price for `qty`, from the live book when it is available.
+    /// `None` only when the mark itself cannot be read.
+    async fn market_protective_price(
+        &self,
+        market: &str,
+        is_buy: bool,
+        qty: f64,
+    ) -> Option<String> {
+        let mark = match self.get_market_mark_price(market).await {
+            Ok(mark) if mark > 0.0 => mark,
+            Ok(_) => return None,
             Err(e) => {
                 warn!(
                     market,
                     error = %e,
                     "mark unavailable; market order will not carry a protective price"
                 );
-                None
+                return None;
             }
+        };
+        let params = self.market_risk_params(market);
+        let levels = self.fetch_depth_levels(market, is_buy).await;
+        let (price, value) = protective_slippage_price(
+            mark,
+            is_buy,
+            params.price_decimals,
+            &levels,
+            qty,
+            params.trading_bound,
+        );
+        if value > 0.0 {
+            info!(
+                market,
+                is_buy,
+                mark,
+                qty,
+                levels = levels.len(),
+                protective = %price,
+                "computed market protective price"
+            );
+            Some(price)
+        } else {
+            None
         }
     }
 
@@ -2465,6 +3512,7 @@ impl TradingClient {
             }
         };
         self.parse_order_result(report, side, quantity, price, market, client_order_id)
+            .await
     }
 
     fn build_marketable_order(
@@ -2477,7 +3525,11 @@ impl TradingClient {
     ) -> BotResult<SubmitOrderRequest> {
         let mut builder = SubmitOrderRequest::builder();
         builder = builder.market(market).account(account_id);
-        builder = if is_buy { builder.buy() } else { builder.sell() };
+        builder = if is_buy {
+            builder.buy()
+        } else {
+            builder.sell()
+        };
         // IOC limit at the side-correct cap. A naked market order cannot carry a
         // price (the SDK rejects one), so the protective price is a marketable limit.
         builder = match protective {
@@ -2506,7 +3558,11 @@ impl TradingClient {
     ) -> BotResult<OrderResult> {
         let (clean_qty, decimals, _) = sanitize_order_quantity_for_market(market, quantity);
         let price_decimals = get_cached_market_price_decimals(market);
-        let side = if is_buy { "Buy (Market)" } else { "Sell (Market)" };
+        let side = if is_buy {
+            "Buy (Market)"
+        } else {
+            "Sell (Market)"
+        };
         let price_label = protective.clone().unwrap_or_else(|| "Market".to_string());
 
         info!(
@@ -2532,7 +3588,10 @@ impl TradingClient {
 
         if !res.success
             && protective.is_some()
-            && res.error_msg.as_deref().map_or(false, is_price_decimal_error)
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_price_decimal_error)
         {
             let current = protective.as_deref().unwrap();
             if let Some((retry_price, new_dec)) =
@@ -2571,7 +3630,11 @@ impl TradingClient {
                     }
                 }
             }
-        } else if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error)
+        } else if !res.success
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_decimal_precision_error)
         {
             if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals)
             {
@@ -2611,7 +3674,11 @@ impl TradingClient {
         }
 
         if !res.success && res.error_msg.as_deref().map_or(false, is_price_bound_error) {
-            if let Some(fresh) = self.market_protective_price(market, is_buy).await {
+            let bound_qty = clean_qty.parse::<f64>().unwrap_or(0.0);
+            if let Some(fresh) = self
+                .market_protective_price(market, is_buy, bound_qty)
+                .await
+            {
                 info!(
                     market,
                     retry_price = %fresh,
@@ -2628,7 +3695,15 @@ impl TradingClient {
                     &retry_coid,
                 ) {
                     if let Ok(retry_res) = self
-                        .submit_parsed(client, retry_order, side, &clean_qty, &fresh, market, &retry_coid)
+                        .submit_parsed(
+                            client,
+                            retry_order,
+                            side,
+                            &clean_qty,
+                            &fresh,
+                            market,
+                            &retry_coid,
+                        )
                         .await
                     {
                         res = retry_res;
@@ -2637,20 +3712,38 @@ impl TradingClient {
             }
         }
 
-        if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
+        if !res.success
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_insufficient_margin_error)
+        {
             if let Ok(val) = clean_qty.parse::<f64>() {
                 for reduction in [0.90_f64, 0.80] {
                     let reduced_val = val * reduction;
                     let (retry_qty, floored) = floor_qty_to_decimals(reduced_val, decimals);
                     if floored > 0.0 && retry_qty != clean_qty {
+                        if let Some(fresh) =
+                            self.market_protective_price(market, is_buy, floored).await
+                        {
+                            info!(
+                                market,
+                                old_price = ?protective,
+                                retry_price = %fresh,
+                                "recomputed protective price from a fresh book before margin retry"
+                            );
+                            protective = Some(fresh);
+                        }
                         info!(
                             market,
                             old_qty = %clean_qty,
                             retry_qty = %retry_qty,
                             reduction,
+                            protective = ?protective,
                             "Retrying market order after InsufficientMargin"
                         );
-                        let retry_label = protective.clone().unwrap_or_else(|| "Market".to_string());
+                        let retry_label =
+                            protective.clone().unwrap_or_else(|| "Market".to_string());
                         let retry_coid = Uuid::new_v4().to_string();
                         if let Ok(retry_order) = Self::build_marketable_order(
                             market,
@@ -2732,7 +3825,9 @@ impl TradingClient {
             }
             None => (None, 0),
         };
-        let price_label = clean_price_opt.clone().unwrap_or_else(|| "Market".to_string());
+        let price_label = clean_price_opt
+            .clone()
+            .unwrap_or_else(|| "Market".to_string());
         info!(
             market,
             side,
@@ -2756,7 +3851,10 @@ impl TradingClient {
 
         if !res.success
             && clean_price_opt.is_some()
-            && res.error_msg.as_deref().map_or(false, is_price_decimal_error)
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_price_decimal_error)
         {
             let current = clean_price_opt.as_deref().unwrap();
             if let Some((retry_price, new_dec)) =
@@ -2794,7 +3892,11 @@ impl TradingClient {
                     }
                 }
             }
-        } else if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error)
+        } else if !res.success
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_decimal_precision_error)
         {
             if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals)
             {
@@ -2834,7 +3936,12 @@ impl TradingClient {
 
         // A close sized with round-half-up can be one lot above the position.
         // Step down and resubmit instead of leaving ReduceOnlyOrderExceedsPosition unlogged.
-        if !res.success && res.error_msg.as_deref().map_or(false, is_reduce_only_exceeds_position) {
+        if !res.success
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_reduce_only_exceeds_position)
+        {
             let mut current_qty = res.quantity.clone();
             if current_qty.is_empty() {
                 current_qty = clean_qty.clone();
@@ -2892,31 +3999,56 @@ impl TradingClient {
         Ok(res)
     }
 
-    /// Place a market buy (long). Protective IOC price is above the mark.
-    /// Same path as `place_user_market_long` (`place_marketable_order`).
-    pub async fn place_market_long(
-        &self,
-        market: &str,
-        quantity: &str,
-    ) -> BotResult<OrderResult> {
-        let protective = self.market_protective_price(market, true).await;
+    /// Place a market buy (long). Same sizing and protective price as
+    /// `place_user_market_long`.
+    pub async fn place_market_long(&self, market: &str, quantity: &str) -> BotResult<OrderResult> {
         let account_id = self.get_effective_account_id().await;
         let client = self.client.lock().await;
-        self.place_marketable_order(&client, &account_id, market, quantity, true, protective)
+        self.place_marketable_for_account(&client, &account_id, None, market, quantity, true, None)
             .await
     }
 
-    /// Place a market sell (short). Protective IOC price is below the mark.
-    /// Same path as `place_user_market_short` (`place_marketable_order`).
-    pub async fn place_market_short(
-        &self,
-        market: &str,
-        quantity: &str,
-    ) -> BotResult<OrderResult> {
-        let protective = self.market_protective_price(market, false).await;
+    /// Place a market sell (short). Same sizing and protective price as
+    /// `place_user_market_short`.
+    pub async fn place_market_short(&self, market: &str, quantity: &str) -> BotResult<OrderResult> {
         let account_id = self.get_effective_account_id().await;
         let client = self.client.lock().await;
-        self.place_marketable_order(&client, &account_id, market, quantity, false, protective)
+        self.place_marketable_for_account(&client, &account_id, None, market, quantity, false, None)
+            .await
+    }
+
+    /// Shared admin/user market entry. Caps `quantity` with [`size_marketable_qty`]
+    /// against spendable margin and submits at a book-walking protective price.
+    async fn place_marketable_for_account(
+        &self,
+        client: &SigningClient,
+        account_id: &str,
+        indexer_id: Option<&str>,
+        market: &str,
+        quantity: &str,
+        is_buy: bool,
+        protective_override: Option<String>,
+    ) -> BotResult<OrderResult> {
+        let requested = quantity.parse::<f64>().unwrap_or(0.0);
+        let (sized_qty, sized_price) = self
+            .cap_requested_market_qty(account_id, indexer_id, market, is_buy, quantity)
+            .await;
+        let sized_f = sized_qty.parse::<f64>().unwrap_or(0.0);
+        if !(sized_f > 0.0) {
+            return Err(BotError::Trading(
+                "Order size is below the lot size for the available margin".into(),
+            ));
+        }
+        // Keep a caller-supplied price only when sizing did not have to shrink
+        // the quantity. A shrink means the book price and the size were solved
+        // together and must stay paired.
+        let shrunk = requested > 0.0 && sized_f + 1e-12 < requested;
+        let protective = if !shrunk {
+            protective_override.or(sized_price)
+        } else {
+            sized_price.or(protective_override)
+        };
+        self.place_marketable_order(client, account_id, market, &sized_qty, is_buy, protective)
             .await
     }
 
@@ -2959,7 +4091,9 @@ impl TradingClient {
             .map_err(|e| BotError::Trading(format!("Build order: {e}")))?;
 
         if order.order_type != OrderType::Limit {
-            return Err(BotError::Trading("Order invariant violated: order_type is not Limit".into()));
+            return Err(BotError::Trading(
+                "Order invariant violated: order_type is not Limit".into(),
+            ));
         }
         if order.limit_price.as_deref() != Some(clean_price.as_str()) {
             return Err(BotError::Trading(format!(
@@ -2989,7 +4123,9 @@ impl TradingClient {
             })?;
         drop(client);
 
-        let mut res = self.parse_order_result(report, "Buy", &clean_qty, &clean_price, market, &coid)?;
+        let mut res = self
+            .parse_order_result(report, "Buy", &clean_qty, &clean_price, market, &coid)
+            .await?;
 
         info!(
             market = %market,
@@ -3004,8 +4140,15 @@ impl TradingClient {
             "Limit BUY order response received from matching engine"
         );
 
-        if !res.success && res.error_msg.as_deref().map_or(false, is_price_decimal_error) {
-            if let Some((retry_price, new_p_dec)) = next_fewer_decimal_price(market, &clean_price, price_decimals) {
+        if !res.success
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_price_decimal_error)
+        {
+            if let Some((retry_price, new_p_dec)) =
+                next_fewer_decimal_price(market, &clean_price, price_decimals)
+            {
                 info!(market = %market, old_price_decimals = price_decimals, new_price_decimals = new_p_dec, retry_price = %retry_price, "Retrying limit buy with 1 fewer price decimal place");
                 let retry_coid = Uuid::new_v4().to_string();
                 if let Ok(retry_order) = SubmitOrderRequest::builder()
@@ -3027,14 +4170,30 @@ impl TradingClient {
                     }
                     if let Ok(retry_rep) = retry_submit {
                         drop(client);
-                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy", &clean_qty, &retry_price, market, &retry_coid) {
+                        if let Ok(retry_res) = self
+                            .parse_order_result(
+                                retry_rep,
+                                "Buy",
+                                &clean_qty,
+                                &retry_price,
+                                market,
+                                &retry_coid,
+                            )
+                            .await
+                        {
                             res = retry_res;
                         }
                     }
                 }
             }
-        } else if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
-            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
+        } else if !res.success
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_decimal_precision_error)
+        {
+            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals)
+            {
                 info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying limit buy with 1 fewer decimal place");
                 let retry_coid = Uuid::new_v4().to_string();
                 if let Ok(retry_order) = SubmitOrderRequest::builder()
@@ -3056,7 +4215,17 @@ impl TradingClient {
                     }
                     if let Ok(retry_rep) = retry_submit {
                         drop(client);
-                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy", &retry_qty, &clean_price, market, &retry_coid) {
+                        if let Ok(retry_res) = self
+                            .parse_order_result(
+                                retry_rep,
+                                "Buy",
+                                &retry_qty,
+                                &clean_price,
+                                market,
+                                &retry_coid,
+                            )
+                            .await
+                        {
                             res = retry_res;
                         }
                     }
@@ -3064,7 +4233,12 @@ impl TradingClient {
             }
         }
 
-        if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
+        if !res.success
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_insufficient_margin_error)
+        {
             if let Ok(val) = clean_qty.parse::<f64>() {
                 for reduction in [0.90, 0.80] {
                     let reduced_val = val * reduction;
@@ -3085,13 +4259,24 @@ impl TradingClient {
                         {
                             let retry_req = Uuid::new_v4().to_string();
                             let client = self.client.lock().await;
-                            let retry_submit = client.submit_order(retry_order, Some(retry_req)).await;
+                            let retry_submit =
+                                client.submit_order(retry_order, Some(retry_req)).await;
                             if let Err(ref retry_err) = retry_submit {
                                 error!(market = %market, error = %retry_err, "retry order submit failed");
                             }
                             if let Ok(retry_rep) = retry_submit {
                                 drop(client);
-                                if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy", &retry_qty, &clean_price, market, &retry_coid) {
+                                if let Ok(retry_res) = self
+                                    .parse_order_result(
+                                        retry_rep,
+                                        "Buy",
+                                        &retry_qty,
+                                        &clean_price,
+                                        market,
+                                        &retry_coid,
+                                    )
+                                    .await
+                                {
                                     res = retry_res;
                                     if res.success {
                                         break;
@@ -3131,7 +4316,9 @@ impl TradingClient {
             .map_err(|e| BotError::Trading(format!("Build order: {e}")))?;
 
         if order.order_type != OrderType::Limit {
-            return Err(BotError::Trading("Order invariant violated: order_type is not Limit".into()));
+            return Err(BotError::Trading(
+                "Order invariant violated: order_type is not Limit".into(),
+            ));
         }
         if order.limit_price.as_deref() != Some(clean_price.as_str()) {
             return Err(BotError::Trading(format!(
@@ -3161,7 +4348,9 @@ impl TradingClient {
             })?;
         drop(client);
 
-        let mut res = self.parse_order_result(report, "Sell", &clean_qty, &clean_price, market, &coid)?;
+        let mut res = self
+            .parse_order_result(report, "Sell", &clean_qty, &clean_price, market, &coid)
+            .await?;
 
         info!(
             market = %market,
@@ -3176,8 +4365,15 @@ impl TradingClient {
             "Limit SELL order response received from matching engine"
         );
 
-        if !res.success && res.error_msg.as_deref().map_or(false, is_price_decimal_error) {
-            if let Some((retry_price, new_p_dec)) = next_fewer_decimal_price(market, &clean_price, price_decimals) {
+        if !res.success
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_price_decimal_error)
+        {
+            if let Some((retry_price, new_p_dec)) =
+                next_fewer_decimal_price(market, &clean_price, price_decimals)
+            {
                 info!(market = %market, old_price_decimals = price_decimals, new_price_decimals = new_p_dec, retry_price = %retry_price, "Retrying limit sell with 1 fewer price decimal place");
                 let retry_coid = Uuid::new_v4().to_string();
                 if let Ok(retry_order) = SubmitOrderRequest::builder()
@@ -3199,14 +4395,30 @@ impl TradingClient {
                     }
                     if let Ok(retry_rep) = retry_submit {
                         drop(client);
-                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &clean_qty, &retry_price, market, &retry_coid) {
+                        if let Ok(retry_res) = self
+                            .parse_order_result(
+                                retry_rep,
+                                "Sell",
+                                &clean_qty,
+                                &retry_price,
+                                market,
+                                &retry_coid,
+                            )
+                            .await
+                        {
                             res = retry_res;
                         }
                     }
                 }
             }
-        } else if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
-            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
+        } else if !res.success
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_decimal_precision_error)
+        {
+            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals)
+            {
                 info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying limit sell with 1 fewer decimal place");
                 let retry_coid = Uuid::new_v4().to_string();
                 if let Ok(retry_order) = SubmitOrderRequest::builder()
@@ -3228,7 +4440,17 @@ impl TradingClient {
                     }
                     if let Ok(retry_rep) = retry_submit {
                         drop(client);
-                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &retry_qty, &clean_price, market, &retry_coid) {
+                        if let Ok(retry_res) = self
+                            .parse_order_result(
+                                retry_rep,
+                                "Sell",
+                                &retry_qty,
+                                &clean_price,
+                                market,
+                                &retry_coid,
+                            )
+                            .await
+                        {
                             res = retry_res;
                         }
                     }
@@ -3236,7 +4458,12 @@ impl TradingClient {
             }
         }
 
-        if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
+        if !res.success
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_insufficient_margin_error)
+        {
             if let Ok(val) = clean_qty.parse::<f64>() {
                 for reduction in [0.90, 0.80] {
                     let reduced_val = val * reduction;
@@ -3257,13 +4484,24 @@ impl TradingClient {
                         {
                             let retry_req = Uuid::new_v4().to_string();
                             let client = self.client.lock().await;
-                            let retry_submit = client.submit_order(retry_order, Some(retry_req)).await;
+                            let retry_submit =
+                                client.submit_order(retry_order, Some(retry_req)).await;
                             if let Err(ref retry_err) = retry_submit {
                                 error!(market = %market, error = %retry_err, "retry order submit failed");
                             }
                             if let Ok(retry_rep) = retry_submit {
                                 drop(client);
-                                if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &retry_qty, &clean_price, market, &retry_coid) {
+                                if let Ok(retry_res) = self
+                                    .parse_order_result(
+                                        retry_rep,
+                                        "Sell",
+                                        &retry_qty,
+                                        &clean_price,
+                                        market,
+                                        &retry_coid,
+                                    )
+                                    .await
+                                {
                                     res = retry_res;
                                     if res.success {
                                         break;
@@ -3345,13 +4583,14 @@ impl TradingClient {
         quantity: &str,
         protective_price: Option<&str>,
     ) -> BotResult<OrderResult> {
-        let protective = match protective_price {
-            Some(p) if !p.is_empty() => Some(p.to_string()),
-            _ => self.market_protective_price(market, true).await,
-        };
+        let protective = protective_price
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_string());
         let client = self.create_user_signing_client(decrypted_key)?;
-        self.place_marketable_order(&client, account_id, market, quantity, true, protective)
-            .await
+        self.place_marketable_for_account(
+            &client, account_id, None, market, quantity, true, protective,
+        )
+        .await
     }
 
     pub async fn place_user_market_short(
@@ -3362,13 +4601,14 @@ impl TradingClient {
         quantity: &str,
         protective_price: Option<&str>,
     ) -> BotResult<OrderResult> {
-        let protective = match protective_price {
-            Some(p) if !p.is_empty() => Some(p.to_string()),
-            _ => self.market_protective_price(market, false).await,
-        };
+        let protective = protective_price
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_string());
         let client = self.create_user_signing_client(decrypted_key)?;
-        self.place_marketable_order(&client, account_id, market, quantity, false, protective)
-            .await
+        self.place_marketable_for_account(
+            &client, account_id, None, market, quantity, false, protective,
+        )
+        .await
     }
 
     pub async fn place_user_limit_long(
@@ -3395,7 +4635,9 @@ impl TradingClient {
             .map_err(|e| BotError::Trading(format!("Build order: {e}")))?;
 
         if order.order_type != OrderType::Limit {
-            return Err(BotError::Trading("Order invariant violated: order_type is not Limit".into()));
+            return Err(BotError::Trading(
+                "Order invariant violated: order_type is not Limit".into(),
+            ));
         }
         if order.limit_price.as_deref() != Some(clean_price.as_str()) {
             return Err(BotError::Trading(format!(
@@ -3425,7 +4667,9 @@ impl TradingClient {
                 BotError::Trading(format!("submit_order: {e}"))
             })?;
 
-        let mut res = self.parse_order_result(report, "Buy", &clean_qty, &clean_price, market, &coid)?;
+        let mut res = self
+            .parse_order_result(report, "Buy", &clean_qty, &clean_price, market, &coid)
+            .await?;
 
         info!(
             market = %market,
@@ -3440,8 +4684,15 @@ impl TradingClient {
             "User Limit BUY order response received from matching engine"
         );
 
-        if !res.success && res.error_msg.as_deref().map_or(false, is_price_decimal_error) {
-            if let Some((retry_price, new_p_dec)) = next_fewer_decimal_price(market, &clean_price, price_decimals) {
+        if !res.success
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_price_decimal_error)
+        {
+            if let Some((retry_price, new_p_dec)) =
+                next_fewer_decimal_price(market, &clean_price, price_decimals)
+            {
                 info!(market = %market, old_price_decimals = price_decimals, new_price_decimals = new_p_dec, retry_price = %retry_price, "Retrying user limit buy with 1 fewer price decimal place");
                 let retry_coid = Uuid::new_v4().to_string();
                 if let Ok(retry_order) = SubmitOrderRequest::builder()
@@ -3461,14 +4712,30 @@ impl TradingClient {
                         error!(market = %market, error = %retry_err, "retry order submit failed");
                     }
                     if let Ok(retry_rep) = retry_submit {
-                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy", &clean_qty, &retry_price, market, &retry_coid) {
+                        if let Ok(retry_res) = self
+                            .parse_order_result(
+                                retry_rep,
+                                "Buy",
+                                &clean_qty,
+                                &retry_price,
+                                market,
+                                &retry_coid,
+                            )
+                            .await
+                        {
                             res = retry_res;
                         }
                     }
                 }
             }
-        } else if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
-            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
+        } else if !res.success
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_decimal_precision_error)
+        {
+            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals)
+            {
                 info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying user limit buy with 1 fewer decimal place");
                 let retry_coid = Uuid::new_v4().to_string();
                 if let Ok(retry_order) = SubmitOrderRequest::builder()
@@ -3488,7 +4755,17 @@ impl TradingClient {
                         error!(market = %market, error = %retry_err, "retry order submit failed");
                     }
                     if let Ok(retry_rep) = retry_submit {
-                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy", &retry_qty, &clean_price, market, &retry_coid) {
+                        if let Ok(retry_res) = self
+                            .parse_order_result(
+                                retry_rep,
+                                "Buy",
+                                &retry_qty,
+                                &clean_price,
+                                market,
+                                &retry_coid,
+                            )
+                            .await
+                        {
                             res = retry_res;
                         }
                     }
@@ -3496,7 +4773,12 @@ impl TradingClient {
             }
         }
 
-        if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
+        if !res.success
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_insufficient_margin_error)
+        {
             if let Ok(val) = clean_qty.parse::<f64>() {
                 for reduction in [0.90, 0.80] {
                     let reduced_val = val * reduction;
@@ -3516,12 +4798,23 @@ impl TradingClient {
                             .build()
                         {
                             let retry_req = Uuid::new_v4().to_string();
-                            let retry_submit = client.submit_order(retry_order, Some(retry_req)).await;
+                            let retry_submit =
+                                client.submit_order(retry_order, Some(retry_req)).await;
                             if let Err(ref retry_err) = retry_submit {
                                 error!(market = %market, error = %retry_err, "retry order submit failed");
                             }
                             if let Ok(retry_rep) = retry_submit {
-                                if let Ok(retry_res) = self.parse_order_result(retry_rep, "Buy", &retry_qty, &clean_price, market, &retry_coid) {
+                                if let Ok(retry_res) = self
+                                    .parse_order_result(
+                                        retry_rep,
+                                        "Buy",
+                                        &retry_qty,
+                                        &clean_price,
+                                        market,
+                                        &retry_coid,
+                                    )
+                                    .await
+                                {
                                     res = retry_res;
                                     if res.success {
                                         break;
@@ -3561,7 +4854,9 @@ impl TradingClient {
             .map_err(|e| BotError::Trading(format!("Build order: {e}")))?;
 
         if order.order_type != OrderType::Limit {
-            return Err(BotError::Trading("Order invariant violated: order_type is not Limit".into()));
+            return Err(BotError::Trading(
+                "Order invariant violated: order_type is not Limit".into(),
+            ));
         }
         if order.limit_price.as_deref() != Some(clean_price.as_str()) {
             return Err(BotError::Trading(format!(
@@ -3591,7 +4886,9 @@ impl TradingClient {
                 BotError::Trading(format!("submit_order: {e}"))
             })?;
 
-        let mut res = self.parse_order_result(report, "Sell", &clean_qty, &clean_price, market, &coid)?;
+        let mut res = self
+            .parse_order_result(report, "Sell", &clean_qty, &clean_price, market, &coid)
+            .await?;
 
         info!(
             market = %market,
@@ -3606,8 +4903,15 @@ impl TradingClient {
             "User Limit SELL order response received from matching engine"
         );
 
-        if !res.success && res.error_msg.as_deref().map_or(false, is_price_decimal_error) {
-            if let Some((retry_price, new_p_dec)) = next_fewer_decimal_price(market, &clean_price, price_decimals) {
+        if !res.success
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_price_decimal_error)
+        {
+            if let Some((retry_price, new_p_dec)) =
+                next_fewer_decimal_price(market, &clean_price, price_decimals)
+            {
                 info!(market = %market, old_price_decimals = price_decimals, new_price_decimals = new_p_dec, retry_price = %retry_price, "Retrying user limit sell with 1 fewer price decimal place");
                 let retry_coid = Uuid::new_v4().to_string();
                 if let Ok(retry_order) = SubmitOrderRequest::builder()
@@ -3627,14 +4931,30 @@ impl TradingClient {
                         error!(market = %market, error = %retry_err, "retry order submit failed");
                     }
                     if let Ok(retry_rep) = retry_submit {
-                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &clean_qty, &retry_price, market, &retry_coid) {
+                        if let Ok(retry_res) = self
+                            .parse_order_result(
+                                retry_rep,
+                                "Sell",
+                                &clean_qty,
+                                &retry_price,
+                                market,
+                                &retry_coid,
+                            )
+                            .await
+                        {
                             res = retry_res;
                         }
                     }
                 }
             }
-        } else if !res.success && res.error_msg.as_deref().map_or(false, is_decimal_precision_error) {
-            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals) {
+        } else if !res.success
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_decimal_precision_error)
+        {
+            if let Some((retry_qty, new_dec)) = next_fewer_decimal_qty(market, &clean_qty, decimals)
+            {
                 info!(market = %market, old_decimals = decimals, new_decimals = new_dec, retry_qty = %retry_qty, "Retrying user limit sell with 1 fewer decimal place");
                 let retry_coid = Uuid::new_v4().to_string();
                 if let Ok(retry_order) = SubmitOrderRequest::builder()
@@ -3654,7 +4974,17 @@ impl TradingClient {
                         error!(market = %market, error = %retry_err, "retry order submit failed");
                     }
                     if let Ok(retry_rep) = retry_submit {
-                        if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &retry_qty, &clean_price, market, &retry_coid) {
+                        if let Ok(retry_res) = self
+                            .parse_order_result(
+                                retry_rep,
+                                "Sell",
+                                &retry_qty,
+                                &clean_price,
+                                market,
+                                &retry_coid,
+                            )
+                            .await
+                        {
                             res = retry_res;
                         }
                     }
@@ -3662,7 +4992,12 @@ impl TradingClient {
             }
         }
 
-        if !res.success && res.error_msg.as_deref().map_or(false, is_insufficient_margin_error) {
+        if !res.success
+            && res
+                .error_msg
+                .as_deref()
+                .map_or(false, is_insufficient_margin_error)
+        {
             if let Ok(val) = clean_qty.parse::<f64>() {
                 for reduction in [0.90, 0.80] {
                     let reduced_val = val * reduction;
@@ -3682,12 +5017,23 @@ impl TradingClient {
                             .build()
                         {
                             let retry_req = Uuid::new_v4().to_string();
-                            let retry_submit = client.submit_order(retry_order, Some(retry_req)).await;
+                            let retry_submit =
+                                client.submit_order(retry_order, Some(retry_req)).await;
                             if let Err(ref retry_err) = retry_submit {
                                 error!(market = %market, error = %retry_err, "retry order submit failed");
                             }
                             if let Ok(retry_rep) = retry_submit {
-                                if let Ok(retry_res) = self.parse_order_result(retry_rep, "Sell", &retry_qty, &clean_price, market, &retry_coid) {
+                                if let Ok(retry_res) = self
+                                    .parse_order_result(
+                                        retry_rep,
+                                        "Sell",
+                                        &retry_qty,
+                                        &clean_price,
+                                        market,
+                                        &retry_coid,
+                                    )
+                                    .await
+                                {
                                     res = retry_res;
                                     if res.success {
                                         break;
@@ -3767,7 +5113,7 @@ impl TradingClient {
 
     // ─── Private helpers ─────────────────────────────────────────────────────
 
-    fn parse_order_result(
+    async fn parse_order_result(
         &self,
         report: TransactionReport,
         side: &str,
@@ -3776,83 +5122,141 @@ impl TradingClient {
         market: &str,
         client_order_id: &str,
     ) -> BotResult<OrderResult> {
-        if !report.success {
-            let err_msg = report
-                .errors
-                .as_ref()
-                .map(|map| {
-                    map.values()
-                        .map(|e| format!("{:?}", e))
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                })
-                .unwrap_or_else(|| "unknown error".into());
+        let (mut res, immediate, account_id) =
+            interpret_submit_report(&report, side, quantity, price, market, client_order_id);
 
-            warn!("Order transaction rejected: {err_msg}");
-            let res = OrderResult {
-                success: false,
-                order_id: None,
-                client_order_id: client_order_id.to_string(),
-                side: side.to_string(),
-                quantity: quantity.to_string(),
-                price: price.to_string(),
-                market: market.to_string(),
-                error_msg: Some(err_msg),
-                fills: vec![],
-            };
-            log_order_outcome(&res);
-            return Ok(res);
-        }
-
-        for receipt in &report.receipts {
-            if let Report::SubmitOrderReport { order, trades } = receipt {
-                let error_msg = order.error.as_ref().map(|e| format!("{e:?}"));
-                let order_id = Some(order.id.to_string());
-
-                let fills = trades
-                    .iter()
-                    .map(|t| FillInfo {
-                        trade_id: t.id.to_string(),
-                        price: t.price.to_string(),
-                        quantity: t.volume.to_string(),
-                    })
-                    .collect();
-
-                let accepted = error_msg.is_none();
-                if !accepted {
-                    warn!("Order placed but engine rejected: {:?}", error_msg);
+        // The matching engine can admit an order and only then reject it.
+        // The submit receipt says success with zero fills; the indexer shows
+        // Rejected / InsufficientMargin a few hundred milliseconds later.
+        let known_engine_error = !res.success
+            && res
+                .error_msg
+                .as_deref()
+                .map(|err| !is_not_filled_message(err))
+                .unwrap_or(false);
+        if !known_engine_error {
+            if let Some(account_id) = account_id.as_deref() {
+                match self
+                    .poll_indexer_order(account_id, client_order_id, immediate)
+                    .await
+                {
+                    Some(snap) => {
+                        let terminal = indexer_status_is_terminal(&snap.status);
+                        apply_indexer_confirmation(&mut res, &snap, immediate);
+                        // An IOC that is still working when the poll budget
+                        // ends did not trade. Do not report that as a fill.
+                        if immediate && !terminal && res.fills.is_empty() {
+                            res.success = false;
+                            res.error_msg =
+                                Some(format!("Not filled (order still {})", snap.status));
+                        }
+                    }
+                    None if immediate && res.fills.is_empty() => {
+                        res.success = false;
+                        res.error_msg =
+                            Some("Not filled (order was not confirmed by the indexer)".to_string());
+                    }
+                    None => {}
                 }
-
-                let res = OrderResult {
-                    success: accepted,
-                    order_id,
-                    client_order_id: client_order_id.to_string(),
-                    side: side.to_string(),
-                    quantity: quantity.to_string(),
-                    price: price.to_string(),
-                    market: market.to_string(),
-                    error_msg,
-                    fills,
-                };
-                log_order_outcome(&res);
-                return Ok(res);
+            } else if immediate && res.fills.is_empty() && res.success {
+                res.success = false;
+                res.error_msg =
+                    Some("Not filled (order was not confirmed by the indexer)".to_string());
             }
         }
 
-        warn!("No SubmitOrderReport receipt in successful transaction");
-        let res = OrderResult {
-            success: report.success,
-            order_id: None,
-            client_order_id: client_order_id.to_string(),
-            side: side.to_string(),
-            quantity: quantity.to_string(),
-            price: price.to_string(),
-            market: market.to_string(),
-            error_msg: None,
-            fills: vec![],
-        };
         log_order_outcome(&res);
         Ok(res)
+    }
+
+    /// Poll `GET /api/v1/accounts/{id}/orders?f[client_order_id]=` until the
+    /// order is terminal, or until a resting order is still active after a
+    /// short grace period. Interval 250ms, budget about 3s.
+    async fn poll_indexer_order(
+        &self,
+        account_id: &str,
+        client_order_id: &str,
+        immediate: bool,
+    ) -> Option<IndexerOrderSnap> {
+        let mut account_ids = vec![account_id.to_string()];
+        if let Some(resolved) = self.resolve_user_indexer_id(account_id).await {
+            if !account_ids
+                .iter()
+                .any(|id| id.eq_ignore_ascii_case(&resolved))
+            {
+                account_ids.push(resolved);
+            }
+        }
+
+        let started = tokio::time::Instant::now();
+        let budget = Duration::from_millis(3000);
+        let interval = Duration::from_millis(250);
+        let resting_grace = Duration::from_millis(500);
+        let mut last = None;
+
+        loop {
+            for id in &account_ids {
+                if let Some(snap) = self.fetch_order_by_client_id(id, client_order_id).await {
+                    if indexer_status_is_terminal(&snap.status) {
+                        info!(
+                            account_id = %id,
+                            client_order_id,
+                            status = %snap.status,
+                            error = ?snap.error,
+                            filled = %snap.filled_qty,
+                            "indexer order reached a terminal status"
+                        );
+                        return Some(snap);
+                    }
+                    if !immediate && started.elapsed() >= resting_grace {
+                        info!(
+                            account_id = %id,
+                            client_order_id,
+                            status = %snap.status,
+                            "indexer order is resting"
+                        );
+                        return Some(snap);
+                    }
+                    last = Some(snap);
+                    break;
+                }
+            }
+            if started.elapsed() >= budget {
+                if let Some(ref snap) = last {
+                    warn!(
+                        client_order_id,
+                        status = %snap.status,
+                        "indexer order was still non-terminal when confirmation timed out"
+                    );
+                } else {
+                    warn!(
+                        client_order_id,
+                        "indexer never returned the submitted order"
+                    );
+                }
+                return last;
+            }
+            tokio::time::sleep(interval).await;
+        }
+    }
+
+    async fn fetch_order_by_client_id(
+        &self,
+        account_id: &str,
+        client_order_id: &str,
+    ) -> Option<IndexerOrderSnap> {
+        let url = format!(
+            "{}/api/v1/accounts/{}/orders?f[client_order_id]={}",
+            self.config.network.indexer_url(),
+            account_id,
+            client_order_id
+        );
+        let resp = self.http.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let val = resp.json::<serde_json::Value>().await.ok()?;
+        indexer_order_from_json(&val, client_order_id)
     }
 
     fn parse_cancel_result(&self, report: TransactionReport) -> CancelResult {
@@ -3866,8 +5270,7 @@ impl TradingClient {
 
         for receipt in &report.receipts {
             if let Report::CancelOrderReport { orders } = receipt {
-                let ids: Vec<String> =
-                    orders.order_ids.iter().map(|id| id.to_string()).collect();
+                let ids: Vec<String> = orders.order_ids.iter().map(|id| id.to_string()).collect();
                 let count = ids.len();
                 return CancelResult {
                     success: true,
@@ -3885,10 +5288,12 @@ impl TradingClient {
     }
 }
 
-// Symmetrical trading parity: admin and per-user market orders share place_marketable_order
-// (side-correct protective price, Error 114 / 121, InsufficientMargin 0.90 then 0.80).
-// Admin and per-user closes share place_reduce_only_order, including the
-// ReduceOnlyOrderExceedsPosition step-down. 100% sizing uses spendable_margin.
+// Symmetrical trading parity: admin place_market_* and per-user place_user_market_*
+// both go through place_marketable_for_account (size_marketable_qty + book price)
+// and place_marketable_order (Error 114 / 121, InsufficientMargin 0.90 then 0.80
+// with a fresh book price on each margin retry). Limit and close paths share
+// parse_order_result, which confirms the indexer before reporting success.
+// Admin and per-user closes share place_reduce_only_order.
 
 #[cfg(test)]
 mod tests {
@@ -3917,7 +5322,12 @@ mod tests {
     #[test]
     fn spendable_matches_available_when_indexer_already_netted_locks() {
         // Live indexer identity: equity = available + orders + positions.
-        let info = bal(1217.204735660901, 943.7277918306023, 48.6136565, 224.86328733029877);
+        let info = bal(
+            1217.204735660901,
+            943.7277918306023,
+            48.6136565,
+            224.86328733029877,
+        );
         let spendable = info.spendable_margin();
         assert!((spendable - info.available_margin).abs() < 1e-6);
     }
@@ -3929,15 +5339,205 @@ mod tests {
     }
 
     #[test]
-    fn protective_price_is_above_mark_for_buys_and_below_for_sells() {
+    fn protective_price_fallback_is_a_tight_offset_inside_the_bound() {
         let mark = 81373.044;
-        let (buy_s, buy) = protective_slippage_price(mark, true, 1);
-        let (sell_s, sell) = protective_slippage_price(mark, false, 1);
+        let (buy_s, buy) = protective_slippage_price(mark, true, 1, &[], 0.001, 0.01);
+        let (sell_s, sell) = protective_slippage_price(mark, false, 1, &[], 0.001, 0.01);
         assert!(buy > mark, "long protective {buy_s} should be above {mark}");
-        assert!(sell < mark, "short protective {sell_s} should be below {mark}");
-        // Inside the 1% trading bound so the IOC cap is not rejected.
+        assert!(
+            sell < mark,
+            "short protective {sell_s} should be below {mark}"
+        );
         assert!(buy < mark * 1.01);
         assert!(sell > mark * 0.99);
+        // Empty book uses mark ± 0.3%, rounded to the tick.
+        assert!((buy - mark * 1.003).abs() < 0.2, "buy {buy_s}");
+        assert!((sell - mark * 0.997).abs() < 0.2, "sell {sell_s}");
+    }
+
+    #[test]
+    fn protective_price_walks_the_book_then_caps_at_the_trading_bound() {
+        let mark = 80000.0;
+        let levels = [
+            BookLevel {
+                price: 80100.0,
+                qty: 0.001,
+            },
+            BookLevel {
+                price: 80200.0,
+                qty: 0.01,
+            },
+        ];
+        // 0.002 needs the second ask. 80200 * 1.0015 = 80320.3
+        let (_, buy) = protective_slippage_price(mark, true, 1, &levels, 0.002, 0.01);
+        assert!((buy - 80320.3).abs() < 0.05, "buy {buy}");
+
+        let bids = [
+            BookLevel {
+                price: 79900.0,
+                qty: 0.001,
+            },
+            BookLevel {
+                price: 79800.0,
+                qty: 0.01,
+            },
+        ];
+        // 79800 * 0.9985 = 79680.3, floored to 1 decimal.
+        let (_, sell) = protective_slippage_price(mark, false, 1, &bids, 0.002, 0.01);
+        assert!((sell - 79680.3).abs() < 0.05, "sell {sell}");
+
+        // A thin book that only quotes outside the bound is pulled back inside it.
+        let far = [BookLevel {
+            price: 90000.0,
+            qty: 5.0,
+        }];
+        let (_, capped) = protective_slippage_price(mark, true, 1, &far, 1.0, 0.01);
+        assert!(capped < mark * 1.01, "capped {capped}");
+        assert!(capped > mark);
+    }
+
+    #[test]
+    fn size_marketable_qty_includes_the_buy_premium_above_mark() {
+        // The order that was logged success/fills=0 and then rejected
+        // InsufficientMargin: 0.0033 BTC buy at 81433.4, mark 80707.06, 40x.
+        let mark = 80707.06;
+        let price = 81433.4;
+        let budget = 6.80;
+        let imr = 0.025;
+        let fee = 0.00019;
+        let (qty, q) = size_marketable_qty(budget, price, mark, true, imr, fee, 0.0001, 4);
+        assert!(q > 0.0, "{qty}");
+        assert!(
+            q < 0.0033,
+            "old size 0.0033 must not fit; helper returned {qty}"
+        );
+        let per = marketable_margin_per_unit(price, mark, true, imr, fee);
+        assert!(q * per <= budget + 1e-6, "{qty} costs {}", q * per);
+        assert!((q + 0.0001) * per > budget);
+        // Required margin of the rejected 0.0033 exceeds the $7.56 that was free.
+        let rejected = 0.0033 * per;
+        assert!(rejected > 7.56, "rejected order margin {rejected}");
+    }
+
+    #[test]
+    fn size_marketable_qty_mirrors_the_premium_for_sells() {
+        let mark = 80707.06;
+        let price = 79980.0;
+        let budget = 6.80;
+        let imr = 0.025;
+        let fee = 0.00019;
+        let (_, sell) = size_marketable_qty(budget, price, mark, false, imr, fee, 0.0001, 4);
+        let per = marketable_margin_per_unit(price, mark, false, imr, fee);
+        assert!(sell > 0.0);
+        assert!(sell * per <= budget + 1e-6);
+        assert!((sell + 0.0001) * per > budget);
+        // A sell priced above the mark pays no extra slippage margin.
+        let above = marketable_margin_per_unit(81000.0, mark, false, imr, fee);
+        let no_slip = 81000.0 * imr + 81000.0 * fee;
+        assert!((above - no_slip).abs() < 1e-9);
+    }
+
+    #[test]
+    fn leverage_is_capped_at_the_inverse_of_imr() {
+        assert!((capped_imr(0.025, 100.0) - 0.025).abs() < 1e-12);
+        assert!((capped_imr(0.025, 40.0) - 0.025).abs() < 1e-12);
+        assert!((capped_imr(0.025, 10.0) - 0.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn parses_rejected_indexer_order_by_client_id() {
+        let raw = r#"{"data":[{"id":"324556885173281310454344958","client_order_id":"abc","status":"Rejected","error":"InsufficientMargin","filled_quantity":"0","average_filled_price":"0"},{"id":"other","client_order_id":"nope","status":"Filled","filled_quantity":"1"}]}"#;
+        let val: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let snap = indexer_order_from_json(&val, "abc").unwrap();
+        assert_eq!(snap.status, "Rejected");
+        assert_eq!(snap.error.as_deref(), Some("InsufficientMargin"));
+        assert!(snap.filled_qty_f <= 0.0);
+        assert!(indexer_order_from_json(&val, "missing").is_none());
+    }
+
+    #[test]
+    fn indexer_rejection_clears_a_false_success() {
+        let mut res = OrderResult {
+            success: true,
+            order_id: Some("1".into()),
+            client_order_id: "cid".into(),
+            side: "Buy (Market)".into(),
+            quantity: "0.0033".into(),
+            price: "81433.4".into(),
+            market: "btc".into(),
+            error_msg: None,
+            fills: vec![],
+        };
+        let snap = IndexerOrderSnap {
+            status: "Rejected".into(),
+            error: Some("InsufficientMargin".into()),
+            filled_qty: "0".into(),
+            filled_qty_f: 0.0,
+            avg_price: "0".into(),
+            order_id: "324556885173281310454344958".into(),
+        };
+        apply_indexer_confirmation(&mut res, &snap, true);
+        assert!(!res.success);
+        assert_eq!(res.error_msg.as_deref(), Some("InsufficientMargin"));
+        assert!(res.fills.is_empty());
+        assert!(is_insufficient_margin_error(
+            res.error_msg.as_deref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn indexer_fill_is_copied_when_the_receipt_had_none() {
+        let mut res = OrderResult {
+            success: true,
+            order_id: None,
+            client_order_id: "cid".into(),
+            side: "Buy (Market)".into(),
+            quantity: "0.0024".into(),
+            price: "80796.6".into(),
+            market: "btc".into(),
+            error_msg: None,
+            fills: vec![],
+        };
+        let snap = IndexerOrderSnap {
+            status: "Filled".into(),
+            error: None,
+            filled_qty: "0.0024".into(),
+            filled_qty_f: 0.0024,
+            avg_price: "80680.1".into(),
+            order_id: "99".into(),
+        };
+        apply_indexer_confirmation(&mut res, &snap, true);
+        assert!(res.success);
+        assert_eq!(res.fills.len(), 1);
+        assert_eq!(res.fills[0].quantity, "0.0024");
+        assert_eq!(res.fills[0].price, "80680.1");
+        assert_eq!(res.order_id.as_deref(), Some("99"));
+    }
+
+    #[test]
+    fn ioc_cancel_with_no_fill_is_not_a_success() {
+        let mut res = OrderResult {
+            success: true,
+            order_id: Some("7".into()),
+            client_order_id: "cid".into(),
+            side: "Sell (Market)".into(),
+            quantity: "0.01".into(),
+            price: "100".into(),
+            market: "sol".into(),
+            error_msg: None,
+            fills: vec![],
+        };
+        let snap = IndexerOrderSnap {
+            status: "Cancelled".into(),
+            error: None,
+            filled_qty: "0".into(),
+            filled_qty_f: 0.0,
+            avg_price: String::new(),
+            order_id: "7".into(),
+        };
+        apply_indexer_confirmation(&mut res, &snap, true);
+        assert!(!res.success);
+        assert!(order_was_not_filled(res.error_msg.as_deref().unwrap()));
     }
 
     #[test]
