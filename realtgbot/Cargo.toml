@@ -44,7 +44,12 @@ aes-gcm = "0.10"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 sha2 = "0.10"
 
-# Unify fastcrypto dependencies so crates.io and git sub-dependencies match the exact commit used by iota
-[patch.crates-io]
-fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "47f8f6b747900bbc1662c4d4eecd2f7e7a29e16a" }
-fastcrypto-derive = { git = "https://github.com/MystenLabs/fastcrypto", rev = "47f8f6b747900bbc1662c4d4eecd2f7e7a29e16a" }
+# The Real.xyz SDK depends on fastcrypto via git at rev 69d496c (crate version
+# 0.1.8) while requiring ^0.1.11. Its workspace patches that git source to
+# crates.io 0.1.11, but Cargo does not inherit [patch] from a git dependency.
+# crates.io 0.1.11 is the 2026-07-02 publish of 47f8f6b — the same commit this
+# repo used to force in via [patch.crates-io]. iota-sdk-crypto also requires
+# registry fastcrypto =0.1.11, so overriding the registry copy with the git rev
+# makes the two sources fail to unify. Mirror the SDK patch here instead.
+[patch."https://github.com/MystenLabs/fastcrypto"]
+fastcrypto = "=0.1.11"
