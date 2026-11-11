@@ -747,7 +747,7 @@ async fn show_main_menu(
 
     let text = format!(
         "💼 *Pocket Real*\n\
-         _Fast & Secure Perp Trading on IOTA_\n\n\
+         _Fast & Secure Perp Trading on Real.xyz_\n\n\
          Network: `{}`\n\
          {}\n\n\
          Select an option below:",
